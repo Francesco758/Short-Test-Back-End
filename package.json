@@ -1,0 +1,44 @@
+{
+  "name": "rplt-back-end",
+  "version": "1.0.0",
+  "description": "RPLT Backend API",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon index.js",
+    "start": "node index.js",
+    "build": "npx prisma generate",
+    "postinstall": "npx prisma generate",
+    "db:push": "npx prisma db push",
+    "db:seed": "node prisma/seed.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "prisma": {
+    "seed": "node prisma/seed.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://adnanshakeel420@bitbucket.org/testest123/rplt-back-end.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@prisma/client": "^6.19.0",
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "fs-extra": "^11.3.2",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.1",
+    "nodemailer": "^7.0.11"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2",
+    "prisma": "^6.19.0"
+  },
+  "engines": {
+    "node": "24.x"
+  }
+}

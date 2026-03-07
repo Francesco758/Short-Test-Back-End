@@ -1,0 +1,199 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                     Int           @id @default(autoincrement())
+  email                  String        @unique
+  password               String
+  role                   Role
+  name                   String?
+  companyId              Int?
+  createdByAdmin         Boolean       @default(false)
+  createdById            Int?
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+  lastLoginAt            DateTime?
+  deletedAt              DateTime?
+  function               String?
+  seniorityBand          String?
+  companyTestAssignments CompanyTest[]
+  tests                  Test[]        @relation("UserTests")
+  company                Company?      @relation(fields: [companyId], references: [id])
+  createdBy              User?         @relation("UserCreatesUsers", fields: [createdById], references: [id])
+  createdUsers           User[]        @relation("UserCreatesUsers")
+  assignedTests          UserTest[]
+
+  @@index([companyId])
+  @@index([email])
+  @@index([role])
+}
+
+model Company {
+  id            Int           @id @default(autoincrement())
+  name          String        @unique
+  description   String?
+  isActive      Boolean       @default(true)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  deletedAt     DateTime?
+  assignedTests CompanyTest[]
+  tests         Test[]        @relation("CompanyTests")
+  users         User[]
+  userTests     UserTest[]
+}
+
+model Test {
+  id                 Int           @id @default(autoincrement())
+  title              String
+  description        String?
+  systemPrompt       String        @db.Text
+  settings           Json?
+  status             TestStatus    @default(DRAFT)
+  isCustom           Boolean       @default(false)
+  createdById        Int
+  companyId          Int?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  deletedAt          DateTime?
+  companyAssignments CompanyTest[]
+  company            Company?      @relation("CompanyTests", fields: [companyId], references: [id])
+  createdBy          User          @relation("UserTests", fields: [createdById], references: [id])
+  testAttempts       TestAttempt[] @relation("TestAttempts")
+  userAssignments    UserTest[]
+
+  @@index([createdById])
+  @@index([companyId])
+  @@index([status])
+}
+
+model CompanyTest {
+  id           Int      @id @default(autoincrement())
+  companyId    Int
+  testId       Int
+  assignedAt   DateTime @default(now())
+  assignedById Int
+  assignedBy   User     @relation(fields: [assignedById], references: [id])
+  company      Company  @relation(fields: [companyId], references: [id])
+  test         Test     @relation(fields: [testId], references: [id])
+
+  @@unique([companyId, testId])
+  @@index([companyId])
+  @@index([testId])
+}
+
+model UserTest {
+  id          Int            @id @default(autoincrement())
+  userId      Int
+  testId      Int
+  companyId   Int
+  status      UserTestStatus @default(ASSIGNED)
+  assignedAt  DateTime       @default(now())
+  deadline    DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  brief       String?        @db.Text
+  totalTime   Int?
+  report      Report?
+  attempts    TestAttempt[]
+  company     Company        @relation(fields: [companyId], references: [id])
+  test        Test           @relation(fields: [testId], references: [id])
+  user        User           @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([testId])
+  @@index([companyId])
+  @@index([status])
+}
+
+model TestAttempt {
+  id           Int          @id @default(autoincrement())
+  userTestId   Int
+  testId       Int?
+  messageCount Int          @default(0)
+  kpis         Json?
+  metadata     Json?
+  isCompleted  Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  gptMessages  GPTMessage[]
+  answers      TestAnswer[]
+  test         Test?        @relation("TestAttempts", fields: [testId], references: [id])
+  userTest     UserTest     @relation(fields: [userTestId], references: [id])
+
+  @@index([userTestId])
+  @@index([testId])
+}
+
+model TestAnswer {
+  id            Int         @id @default(autoincrement())
+  testAttemptId Int
+  messageIndex  Int
+  userMessage   String      @db.Text
+  gptResponse   String?     @db.Text
+  gptRating     Int?
+  gptFeedback   String?     @db.Text
+  components    Json?
+  createdAt     DateTime    @default(now())
+  testAttempt   TestAttempt @relation(fields: [testAttemptId], references: [id])
+
+  @@index([testAttemptId])
+  @@index([messageIndex])
+}
+
+model Report {
+  id               Int      @id @default(autoincrement())
+  userTestId       Int      @unique
+  summary          String   @db.Text
+  kpis             Json
+  detailedAnalysis Json?
+  createdAt        DateTime @default(now())
+  userTest         UserTest @relation(fields: [userTestId], references: [id])
+
+  @@index([userTestId])
+}
+
+model GPTMessage {
+  id            Int         @id @default(autoincrement())
+  testAttemptId Int
+  role          String
+  content       String      @db.Text
+  createdAt     DateTime    @default(now())
+  testAttempt   TestAttempt @relation(fields: [testAttemptId], references: [id])
+
+  @@index([testAttemptId])
+}
+
+model SystemSetting {
+  id        Int      @id @default(autoincrement())
+  key       String   @unique
+  value     String   @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+enum Role {
+  SUPER_ADMIN
+  COMPANY_ADMIN
+  USER
+  STUDENT
+  TEACHER
+}
+
+enum TestStatus {
+  DRAFT
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+enum UserTestStatus {
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  EXPIRED
+}
