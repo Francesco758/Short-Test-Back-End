@@ -16,4 +16,20 @@ async function updateOpenAI(req, res, next) {
   } catch (err) { next(err); }
 }
 
-module.exports = { getOpenAI, updateOpenAI };
+async function getTransforMachine(req, res, next) {
+  try {
+    const data = await settingsService.getTransforMachinePrompt();
+    res.json(data);
+  } catch (err) { next(err); }
+}
+
+async function updateTransforMachine(req, res, next) {
+  try {
+    const { prompt } = req.body || {};
+    await settingsService.updateTransforMachinePrompt({ prompt });
+    const updated = await settingsService.getTransforMachinePrompt();
+    res.json(updated);
+  } catch (err) { next(err); }
+}
+
+module.exports = { getOpenAI, updateOpenAI, getTransforMachine, updateTransforMachine };

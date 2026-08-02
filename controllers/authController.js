@@ -36,9 +36,20 @@ async function changePassword(req, res, next) {
   }
 }
 
+async function guestLogin(req, res, next) {
+  try {
+    const result = await authService.guestLogin(req.body);
+    if (result.token) res.setHeader('Authorization', `Bearer ${result.token}`);
+    res.json(result);
+  } catch (err) { 
+    next(err); 
+  }
+}
+
 module.exports = { 
   register, 
   login, 
   me, 
-  changePassword 
+  changePassword,
+  guestLogin
 };

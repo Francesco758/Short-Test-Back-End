@@ -1,10 +1,20 @@
 const { prisma } = require('../../utils/prismaClient');
-// Remove the hash import since we don't need it
+
+function prepareUserData(data) {
+  const prepared = { ...data };
+  if (prepared.dateOfBirth && typeof prepared.dateOfBirth === 'string') {
+    prepared.dateOfBirth = new Date(prepared.dateOfBirth + 'T00:00:00.000Z');
+  }
+  if (prepared.dateOfBirth === '' || prepared.dateOfBirth === null || prepared.dateOfBirth === undefined) {
+    delete prepared.dateOfBirth;
+  }
+  return prepared;
+}
 
 async function createUser(data) {
   return prisma.user.create({
     data: { 
-      ...data,
+      ...prepareUserData(data),
       password: data.password,
       role: data.role || 'USER'
     },
@@ -33,7 +43,7 @@ async function updateUser(id, data, companyId) {
   }
   return prisma.user.update({
     where: { id },
-    data,
+    data: prepareUserData(data),
     include: { assignedTests: { include: { test: true } } }
   });
 }
@@ -47,7 +57,7 @@ async function deleteUser(id, companyId) {
 
 async function bulkCreateUsers(users, companyId) {
   const usersWithPlainText = users.map((user) => ({
-    ...user,
+    ...prepareUserData(user),
     password: user.password,
     companyId,
     role: user.role || 'USER'

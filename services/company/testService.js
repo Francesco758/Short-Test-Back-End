@@ -176,8 +176,54 @@ async function sendBulkAssignmentEmails(users, tests, companyName) {
   }
 }
 
+async function setGuestAccess({ testId, companyId, enabled }) {
+  const companyTest = await prisma.companyTest.findFirst({
+    where: { testId, companyId }
+  });
+
+  if (!companyTest) {
+    throw new Error('Test not assigned to company');
+  }
+
+  const updated = await prisma.companyTest.update({
+    where: { id: companyTest.id },
+    data: { guestAccess: enabled },
+    include: { test: true }
+  });
+
+  return updated;
+}
+
+async function getGuestAccessCompanies() {
+  const companyTests = await prisma.companyTest.findMany({
+    where: { guestAccess: true },
+    include: {
+      company: { select: { id: true, name: true } },
+      test: { select: { id: true, title: true } }
+    },
+    distinct: ['companyId']
+  });
+
+  // Deduplicate by company
+  const seen = new Set();
+  const companies = [];
+  for (const ct of companyTests) {
+    if (!seen.has(ct.company.id)) {
+      seen.add(ct.company.id);
+      companies.push({
+        id: ct.company.id,
+        name: ct.company.name
+      });
+    }
+  }
+
+  return companies;
+}
+
 module.exports = { 
   getAssignedTests, 
   assignTestToUsers, 
-  bulkAssignTests 
+  bulkAssignTests,
+  setGuestAccess,
+  getGuestAccessCompanies
 };

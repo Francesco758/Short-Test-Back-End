@@ -2,11 +2,18 @@ const { prisma } = require('../../utils/prismaClient');
 const conversationService = require('../conversationServiceSimplified');
 
 async function getAssignedTests(userId) {
-  return prisma.userTest.findMany({
+  // Get user to check if guest
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, isGuest: true, companyId: true }
+  });
+
+  // Fetch regular assignments
+  const assignedTests = await prisma.userTest.findMany({
     where: { userId, status: { in: ['ASSIGNED', 'IN_PROGRESS', 'COMPLETED'] } },
     include: { 
       test: true,
-      report: true, // Include report for completed tests
+      report: true,
       attempts: { 
         orderBy: { createdAt: 'desc' }, 
         take: 1,
@@ -19,6 +26,41 @@ async function getAssignedTests(userId) {
     },
     orderBy: { assignedAt: 'desc' }
   });
+
+  // For guests: also auto-create UserTest records for guest-accessible tests
+  if (user?.isGuest && user?.companyId) {
+    const guestAccessible = await prisma.companyTest.findMany({
+      where: { companyId: user.companyId, guestAccess: true },
+      include: { test: true }
+    });
+
+    for (const ct of guestAccessible) {
+      const alreadyHas = assignedTests.some(ut => ut.testId === ct.testId);
+      if (!alreadyHas) {
+        const newUt = await prisma.userTest.create({
+          data: {
+            userId: user.id,
+            testId: ct.testId,
+            companyId: user.companyId,
+            status: 'ASSIGNED',
+            assignedAt: new Date()
+          },
+          include: {
+            test: true,
+            report: true,
+            attempts: {
+              orderBy: { createdAt: 'desc' },
+              take: 1,
+              include: { answers: { orderBy: { createdAt: 'asc' } } }
+            }
+          }
+        });
+        assignedTests.unshift(newUt);
+      }
+    }
+  }
+
+  return assignedTests;
 }
 
 async function startTest(userTestId, userId) {
@@ -230,21 +272,36 @@ async function generateFinalReport(userTestId) {
     : 50; // Default fallback
   
   const components = {
-    creativity: calculateComponentAverage(answers, 'creativity'),
+    simplification: calculateComponentAverage(answers, 'simplification'),
+    originality: calculateComponentAverage(answers, 'originality') || calculateComponentAverage(answers, 'creativity'),
     feasibility: calculateComponentAverage(answers, 'feasibility'),
-    proactivity: calculateComponentAverage(answers, 'proactivity')
+    criticalThinking: calculateComponentAverage(answers, 'criticalThinking'),
+    proactivity: calculateComponentAverage(answers, 'proactivity'),
+    impact: calculateComponentAverage(answers, 'impact')
   };
-  
+  // Compute final KPI as average of the six components when available
+  const compValues = [
+    components.simplification || 0,
+    components.originality || 0,
+    components.feasibility || 0,
+    components.criticalThinking || 0,
+    components.proactivity || 0,
+    components.impact || 0
+  ];
+  const computedFinal = Math.round(compValues.reduce((s, v) => s + v, 0) / compValues.length);
+
+  const finalValue = (compValues.some(v => v > 0)) ? computedFinal : finalKPI;
+
   return {
-    summary: `Change KPI: ${finalKPI}% - ${getKPILevel(finalKPI)}`,
+    summary: `Change KPI: ${finalValue}% - ${getKPILevel(finalValue)}`,
     kpis: {
-      final: finalKPI,
+      final: finalValue,
       components,
-      method: ratings.length > 0 ? 'gpt-average' : 'default',
+      method: (compValues.some(v => v > 0)) ? 'components-average' : (ratings.length > 0 ? 'gpt-average' : 'default'),
       ratingsCount: ratings.length,
       phasesCompleted: answers.length
     },
-    detailedAnalysis: generateDetailedAnalysis(answers, finalKPI)
+    detailedAnalysis: generateDetailedAnalysis(answers, finalValue)
   };
 }
 

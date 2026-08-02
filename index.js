@@ -16,6 +16,10 @@ const adminTestRoutes = require('./routes/admin/tests');
 const adminUserRoutes = require('./routes/admin/users');
 const adminDashboardRoutes = require('./routes/admin/dashboard');
 const adminSettingsRoutes = require('./routes/admin/settings');
+const adminUsageRoutes = require('./routes/admin/usage');
+
+// Observatory routes (read-only dashboard for managers)
+const observatoryRoutes = require('./routes/observatory');
 
 // Company routes
 const companyUserRoutes = require('./routes/company/users.js');
@@ -26,9 +30,12 @@ const companyReportRoutes = require('./routes/company/reports.js');
 const userTestRoutes = require('./routes/user/tests.js');
 const userProfileRoutes = require('./routes/user/profile.js');
 const userReportRoutes = require('./routes/user/reports.js');
+const teamRoutes = require('./routes/team');
+const conversationService = require('./services/conversationServiceSimplified');
 
 // Error handler
 const errorHandler = require('./middleware/errorHandler');
+const correlationId = require('./middleware/correlationId');
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
@@ -62,6 +69,7 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '10mb' }));
+app.use(correlationId);
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(morgan(isProduction ? 'combined' : 'dev'));
 
@@ -142,6 +150,10 @@ app.use('/api/admin/tests', adminTestRoutes);
 app.use('/api/admin/users', adminUserRoutes);
 app.use('/api/admin/dashboard', adminDashboardRoutes);
 app.use('/api/admin/settings', adminSettingsRoutes);
+app.use('/api/admin/usage', adminUsageRoutes);
+
+// Observatory routes (read-only dashboard for managers)
+app.use('/api/observatory', observatoryRoutes);
 
 // Company routes
 app.use('/api/company/users', companyUserRoutes);
@@ -152,6 +164,7 @@ app.use('/api/company/reports', companyReportRoutes);
 app.use('/api/user/tests', userTestRoutes);
 app.use('/api/user/profile', userProfileRoutes);
 app.use('/api/user/reports', userReportRoutes);
+app.use('/api/team', teamRoutes);
 
 // 404 handler
 app.use((req, res) => res.status(404).json({ 
@@ -184,6 +197,7 @@ ${isVercel ? '☁️  Platform: Vercel Serverless' : '💻 Platform: Local Serve
   // Graceful shutdown for local server
   function shutdown(signal) {
     console.log(`\n📭 Received ${signal}. Shutting down gracefully...`);
+    if (global.staleCheckInterval) clearInterval(global.staleCheckInterval);
     server.close(() => {
       console.log('✅ HTTP server closed.');
       process.exit(0);

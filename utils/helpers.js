@@ -21,7 +21,23 @@ function paginateResults(results, page, limit, total) {
 
 function calculateAverageKPI(reports) {
   if (!reports.length) return 0;
-  const sum = reports.reduce((total, report) => total + (report.kpis?.final || 0), 0);
+  const sum = reports.reduce((total, report) => {
+    // Prefer explicit final value when available
+    if (typeof report.kpis?.final === 'number') return total + report.kpis.final;
+
+    // Otherwise derive from components (supporting 6 params, fall back to 0 when missing)
+    const comps = report.kpis?.components || {};
+    const vals = [
+      Number.isFinite(comps.simplification) ? comps.simplification : (Number.isFinite(comps.simplify) ? comps.simplify : 0),
+      Number.isFinite(comps.originality) ? comps.originality : (Number.isFinite(comps.creativity) ? comps.creativity : 0),
+      Number.isFinite(comps.feasibility) ? comps.feasibility : 0,
+      Number.isFinite(comps.criticalThinking) ? comps.criticalThinking : 0,
+      Number.isFinite(comps.proactivity) ? comps.proactivity : 0,
+      Number.isFinite(comps.impact) ? comps.impact : 0
+    ];
+    const avg = vals.reduce((s, v) => s + v, 0) / vals.length;
+    return total + avg;
+  }, 0);
   return Math.round(sum / reports.length);
 }
 

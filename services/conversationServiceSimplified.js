@@ -1,5 +1,12 @@
 const { prisma } = require('../utils/prismaClient');
 const { streamChatCompletion, evaluateAnswer, runChatWithTools, defaultTools } = require('./gptService');
+const teamService = require('./teamService');
+const logger = require('../utils/logger');
+const { ConflictError, ValidationError } = require('../utils/errors');
+
+const MAX_MESSAGES_PER_ATTEMPT = 50;
+const MIN_MESSAGE_INTERVAL_MS = 2000;
+const MAX_IMAGE_GENERATIONS_PER_ATTEMPT = 8;
 
 /**
  * Simplified Dynamic Conversation Service
@@ -11,11 +18,13 @@ const { streamChatCompletion, evaluateAnswer, runChatWithTools, defaultTools } =
 /**
  * Start a new test conversation
  */
-async function startTestConversation({ user, body }) {
+async function startTestConversation({ user, body, requestId }) {
   const { userTestId } = body;
 
+  const log = logger.child({ requestId, userTestId, component: 'startTest' });
+
   if (!userTestId) {
-    throw new Error('userTestId is required');
+    throw new ValidationError('userTestId is required');
   }
 
   // Get user test with test details
@@ -95,7 +104,8 @@ async function startTestConversation({ user, body }) {
             }
           ],
           temperature: 0.7,
-          tools: defaultTools()
+          tools: defaultTools(),
+          context: { userId: user.id, companyId: user.companyId, source: 'test_message' }
         });
         
         const rawGptResponse = chatResult.gptResponse || chatResult.content;
@@ -103,7 +113,7 @@ async function startTestConversation({ user, body }) {
         const components = buildComponentsFromToolOutputs(toolOutputs);
         
         let cleanedInitialResponse = rawGptResponse;
-        if (components && components.imageUrl) {
+        if (components && components.imageUrl && !components.imageUrl.startsWith('data:')) {
           const url = components.imageUrl;
           const escapedUrl = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           cleanedInitialResponse = cleanedInitialResponse.replace(new RegExp(`!\\[.*?\\]\\(${escapedUrl}\\)`, 'g'), '');
@@ -128,6 +138,7 @@ async function startTestConversation({ user, body }) {
           data: {
             testAttemptId: testAttempt.id,
             messageIndex: 0,
+            userMessage: '',
             gptResponse: initialGptResponse,
             components: components || undefined
           }
@@ -149,9 +160,8 @@ async function startTestConversation({ user, body }) {
           isCustom: userTest.test.isCustom,
           testTitle: userTest.test.title
         };
-      } catch (err) {
-        console.error('Failed to generate initial GPT response:', err);
-        // Fallback or just continue with null
+    } catch (err) {
+        log.error({ err }, 'Failed to generate initial GPT response');
       }
     }
 
@@ -189,11 +199,13 @@ async function startTestConversation({ user, body }) {
     };
 
     if (msg.role === 'assistant') {
-      // Find matching answer to get components
-      const matchingAnswer = testAnswers.find(a => a.gptResponse === msg.content);
+      // Pair assistant messages with TestAnswers in chronological order
+      // (each TestAnswer corresponds to one exchange; initial assistant is index 0)
+      const matchingAnswer = testAnswers[answerIdx];
       if (matchingAnswer && matchingAnswer.components) {
         formatted.components = matchingAnswer.components;
       }
+      answerIdx++;
     }
     formattedMessages.push(formatted);
   }
@@ -212,8 +224,9 @@ async function startTestConversation({ user, body }) {
 /**
  * Handle user message in ongoing conversation
  */
-async function handleUserMessage({ user, body }) {
+async function handleUserMessage({ user, body, requestId }) {
   const { userTestId, message } = body;
+  const log = logger.child({ requestId, userTestId, component: 'handleMessage' });
 
   if (!userTestId || !message || message.trim().length === 0) {
     throw new Error('userTestId and message are required');
@@ -247,6 +260,24 @@ async function handleUserMessage({ user, body }) {
 
   if (testAttempt.isCompleted) {
     throw new Error('This test has already been completed');
+  }
+
+  // Rate limit: max messages per attempt
+  if (testAttempt.messageCount >= MAX_MESSAGES_PER_ATTEMPT && message.trim().toLowerCase() !== 'finish my test') {
+    const err = new Error(`Maximum of ${MAX_MESSAGES_PER_ATTEMPT} messages reached. Please finish your test.`);
+    err.status = 429;
+    throw err;
+  }
+
+  // Rate limit: minimum interval between messages (skip for manual finish)
+  if (testAttempt.gptMessages.length > 0 && message.trim().toLowerCase() !== 'finish my test') {
+    const lastMsg = testAttempt.gptMessages[testAttempt.gptMessages.length - 1];
+    const elapsed = Date.now() - new Date(lastMsg.createdAt).getTime();
+    if (elapsed < MIN_MESSAGE_INTERVAL_MS) {
+      const err = new Error('Please wait a moment before sending another message.');
+      err.status = 429;
+      throw err;
+    }
   }
 
   // ✅ MANUAL FINISH TRIGGER: Check if user wants to end the test
@@ -306,14 +337,34 @@ async function handleUserMessage({ user, body }) {
       }
     ];
 
-    // Use non-stream with tools
-    const chatResult = await runChatWithTools({
-      messages: conversationHistory,
-      temperature: 0.7,
-      tools: defaultTools()
+    // Rate limit: count existing image generations in this attempt
+    const existingAnswers = await prisma.testAnswer.findMany({
+      where: { testAttemptId: testAttempt.id },
+      select: { components: true }
     });
-    gptResponse = chatResult.gptResponse || chatResult.content;
-    toolOutputs = chatResult.toolOutputs || [];
+    const existingImageCount = existingAnswers.filter(a => a.components?.imageUrl).length;
+    const testContext = { userId: user.id, companyId: user.companyId, source: 'test_message' };
+    if (existingImageCount >= MAX_IMAGE_GENERATIONS_PER_ATTEMPT) {
+      // Strip image generation tool from available tools to prevent further image calls
+      const filteredTools = defaultTools().filter(t => t.function?.name !== 'generate_image');
+      const chatResult = await runChatWithTools({
+        messages: conversationHistory,
+        temperature: 0.7,
+        tools: filteredTools,
+        context: testContext
+      });
+      gptResponse = chatResult.gptResponse || chatResult.content;
+      toolOutputs = chatResult.toolOutputs || [];
+    } else {
+      const chatResult = await runChatWithTools({
+        messages: conversationHistory,
+        temperature: 0.7,
+        tools: defaultTools(),
+        context: testContext
+      });
+      gptResponse = chatResult.gptResponse || chatResult.content;
+      toolOutputs = chatResult.toolOutputs || [];
+    }
 
     // Check if GPT indicates completion
     const completionKeywords = [
@@ -327,7 +378,13 @@ async function handleUserMessage({ user, body }) {
       'generated your report',
       'here is your report',
       'here is your final evaluation',
-      'your test is complete'
+      'your test is complete',
+      'this test is now complete',
+      'you have completed the',
+      'your results have been recorded',
+      'shortest is now complete',
+      'test is now complete',
+      'the assessment is finished'
     ];
 
     // ✅ AUTO-COMPLETE: If GPT generates a chart, it's a strong signal of completion
@@ -352,21 +409,15 @@ async function handleUserMessage({ user, body }) {
   const components = buildComponentsFromToolOutputs(toolOutputs);
   
   if (components && components.imageUrl) {
-    // Remove the raw URL if it appears in the text
-    // Also try to remove markdown image syntax if it's there
     const url = components.imageUrl;
-    // Escape URL for regex
-    const escapedUrl = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    
-    // Pattern 1: Markdown image ![alt](url)
-    const mdImageRegex = new RegExp(`!\\[.*?\\]\\(${escapedUrl}\\)`, 'g');
-    cleanedGptResponse = cleanedGptResponse.replace(mdImageRegex, '');
-    
-    // Pattern 2: Raw URL
-    const rawUrlRegex = new RegExp(escapedUrl, 'g');
-    cleanedGptResponse = cleanedGptResponse.replace(rawUrlRegex, '');
-    
-    // Clean up any double newlines or trailing spaces left behind
+    // Skip regex cleaning for data URIs (base64/SVG) — they're never in GPT text
+    if (!url.startsWith('data:')) {
+      const escapedUrl = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const mdImageRegex = new RegExp(`!\\[.*?\\]\\(${escapedUrl}\\)`, 'g');
+      cleanedGptResponse = cleanedGptResponse.replace(mdImageRegex, '');
+      const rawUrlRegex = new RegExp(escapedUrl, 'g');
+      cleanedGptResponse = cleanedGptResponse.replace(rawUrlRegex, '');
+    }
     cleanedGptResponse = cleanedGptResponse.replace(/\n\n+/g, '\n\n').trim();
   }
 
@@ -397,31 +448,31 @@ async function handleUserMessage({ user, body }) {
     data: { messageCount: newMessageCount }
   });
 
-  // ✅ AUTO-COMPLETE: If manually finished OR GPT detected completion, trigger the completeTest logic
-  if (isManualFinish || shouldComplete) {
-    // Only trigger background completion if it's NOT a manual finish.
-    // Manual finish returns a specific response and expects the frontend to call /complete.
-    if (!isManualFinish && shouldComplete) {
-      console.log(`[Conversation] Auto-completing test ${userTestId} in background...`);
-      completeTest({ user, userTestId }).catch(err => {
-        if (err.status === 409 || err.message === 'ALREADY_COMPLETED') {
-          console.log(`[Conversation] Background auto-completion for ${userTestId} skipped: already in progress.`);
-        } else {
-          console.error("[Conversation] Error in background auto-completion:", err);
-        }
-      });
+  // ✅ AUTO-COMPLETE: If GPT detected completion, run evaluation synchronously
+  // so the report is ready before /message returns and /complete returns instantly.
+  if (shouldComplete) {
+    log.info('Completing test synchronously');
+    let evaluationResult = null;
+    try {
+      const completeResult = await completeTest({ user, userTestId, requestId });
+      evaluationResult = completeResult.evaluation || null;
+    } catch (err) {
+      if (err instanceof ConflictError || err.status === 409) {
+        log.info('Completion already handled');
+      } else {
+        log.error({ err }, 'Error in synchronous completion');
+      }
     }
     
-    if (isManualFinish) {
-      return {
-        testAttemptId: testAttempt.id,
-        gptResponse: cleanedGptResponse,
-        messageCount: newMessageCount,
-        isCompleted: true,
-        suggestedCompletion: true,
-        components: undefined
-      };
-    }
+    return {
+      testAttemptId: testAttempt.id,
+      gptResponse: cleanedGptResponse,
+      messageCount: newMessageCount,
+      isCompleted: true,
+      suggestedCompletion: true,
+      components,
+      evaluation: evaluationResult
+    };
   }
 
   return {
@@ -437,7 +488,9 @@ async function handleUserMessage({ user, body }) {
 /**
  * Complete the test and generate report
  */
-async function completeTest({ user, userTestId }) {
+async function completeTest({ user, userTestId, requestId }) {
+  const log = logger.child({ requestId, userTestId, component: 'completeTest' });
+
   const userTest = await prisma.userTest.findFirst({
     where: {
       id: parseInt(userTestId),
@@ -463,7 +516,7 @@ async function completeTest({ user, userTestId }) {
 
   // ✅ IDEMPOTENCY CHECK: If already completed and report exists, return it immediately
   if (userTest.status === 'COMPLETED' && userTest.report) {
-    console.log(`[CompleteTest] Test ${userTestId} already completed. Returning existing report.`);
+    log.info('Test already completed. Returning existing report.');
     return {
       message: 'Test already completed',
       evaluation: {
@@ -496,18 +549,19 @@ async function completeTest({ user, userTestId }) {
     });
 
     if (updatedUserTest.count === 0) {
-      throw new Error('ALREADY_COMPLETED');
+      log.warn('Lock acquisition failed - test already being processed');
+      throw new ConflictError('Test evaluation already in progress', 'ALREADY_COMPLETED');
     }
 
-    console.log(`[CompleteTest] Lock acquired for test ${userTestId}. Proceeding with evaluation.`);
+    log.info('Lock acquired. Proceeding with evaluation.');
   } catch (err) {
     // If update fails because of the 'where' clause or explicit error, it means it's already COMPLETED or being processed
-    console.log(`[CompleteTest] Test ${userTestId} already being processed or completed. Polling for report...`);
+    log.warn('Test already being processed. Polling for report...');
     
     // Polling mechanism to wait for the other process to finish evaluation and create the report
     let finalUserTest;
-    const maxPollAttempts = 12; // 18 seconds total
-    const pollInterval = 1500; 
+    const maxPollAttempts = 15;
+    const pollInterval = 500;
 
     for (let i = 0; i < maxPollAttempts; i++) {
       finalUserTest = await prisma.userTest.findUnique({
@@ -516,7 +570,7 @@ async function completeTest({ user, userTestId }) {
       });
 
       if (finalUserTest?.report) {
-        console.log(`[CompleteTest] Report found for ${userTestId} after ${i + 1} polls.`);
+        log.info({ pollAttempts: i + 1 }, 'Report found after polling');
         return {
           message: 'Test completed',
           evaluation: {
@@ -548,42 +602,56 @@ async function completeTest({ user, userTestId }) {
     data: { isCompleted: true }
   });
 
-  // Generate evaluation using GPT
+  // Generate evaluation using GPT — single consolidated call
   const conversationSummary = testAttempt.answers
     .map((a, i) => `Exchange ${i + 1}:\nUser: ${a.userMessage}\nGPT: ${a.gptResponse || 'N/A'}`)
     .join('\n\n');
 
-  const evaluationPrompt = `You are an expert evaluator for behavioral assessments. 
+  const systemPrompt = userTest.test.systemPrompt || 'No specific assessment criteria provided.';
+  const evaluationPrompt = `You are an evaluator. Use the following assessment criteria to evaluate the user's responses.
 
-Based on the following conversation, provide a comprehensive evaluation with scores:
+ASSESSMENT CRITERIA:
+${systemPrompt}
+
+Based on the conversation below, score the user on each of the 6 dimensions and provide detailed analysis.
 
 CONVERSATION:
 ${conversationSummary}
 
-Provide your evaluation in JSON format with:
+Return ONLY valid JSON with these exact keys:
 {
-  "overallScore": <number 0-100>,
-  "creativity": <number 0-100>,
-  "feasibility": <number 0-100>,
-  "proactivity": <number 0-100>,
-  "summary": "<detailed summary paragraph>",
-  "strengths": ["<strength 1>", "<strength 2>", ...],
-  "improvements": ["<improvement 1>", "<improvement 2>", ...],
-  "reasoning": "<brief explanation of scoring rationale>",
-  "confidence": <number 0-100, how confident you are in this evaluation>
+  "simplification": <0-100>,
+  "originality": <0-100>,
+  "feasibility": <0-100>,
+  "criticalThinking": <0-100>,
+  "proactivity": <0-100>,
+  "impact": <0-100>,
+  "summary": "<detailed paragraph>",
+  "strengths": ["strength1", "strength2", ...],
+  "improvements": ["improvement1", "improvement2", ...],
+  "reasoning": "<rationale for scores>",
+  "confidence": <0-100>,
+  "problem_summary": "<what problem the user addressed>",
+  "solution_summary": "<what solution the user proposed>",
+  "problem_cluster": "<category slug e.g. INTERNAL_COMM>",
+  "solution_cluster": "<category slug e.g. PROCESS_OPTIMIZATION>",
+  "problem_key": "<stable slug>",
+  "problem_topic": "<human-readable title>",
+  "solution_key": "<stable slug>",
+  "solution_topic": "<human-readable title>"
 }
 
 IMPORTANT: All scores must be integers between 0 and 100.`;
 
   let evaluationResult;
   let evaluationAttempts = 0;
-  const maxRetries = 3;
+  const maxRetries = 2;
   
   const evaluationModel = process.env.OPENAI_EVAL_MODEL || 'gpt-4o-mini';
   while (evaluationAttempts < maxRetries) {
     try {
       evaluationAttempts++;
-      console.log(`[Evaluation] Attempt ${evaluationAttempts}/${maxRetries} for userTestId: ${userTestId}`);
+      log.info({ attempt: evaluationAttempts, maxRetries }, 'Starting evaluation attempt');
       
       evaluationResult = await evaluateAnswer({
         model: evaluationModel,
@@ -592,47 +660,62 @@ IMPORTANT: All scores must be integers between 0 and 100.`;
           { role: 'user', content: evaluationPrompt }
         ],
         temperature: 0.3,
-        max_tokens: 1500
+        max_tokens: 2000,
+        context: { userId: user.id, companyId: user.companyId, source: 'test_evaluation' }
       });
       
-      // Validate and normalize scores
+      // Validate, normalize, and compute overallScore
       evaluationResult = validateAndNormalizeEvaluation(evaluationResult);
       
-      // Log successful evaluation
-      console.log(`[Evaluation] Success for userTestId: ${userTestId}`, {
-        overallScore: evaluationResult.overallScore,
-        components: evaluationResult.creativity !== undefined ? {
-          creativity: evaluationResult.creativity,
+      log.info({
+        attempt: evaluationAttempts,
+        ckpi: {
+          simplification: evaluationResult.simplification,
+          originality: evaluationResult.originality,
           feasibility: evaluationResult.feasibility,
-          proactivity: evaluationResult.proactivity
-        } : 'N/A',
+          criticalThinking: evaluationResult.criticalThinking,
+          proactivity: evaluationResult.proactivity,
+          impact: evaluationResult.impact
+        },
+        overallScore: evaluationResult.overallScore,
         confidence: evaluationResult.confidence || 'N/A',
         messageCount: testAttempt.messageCount
-      });
+      }, 'Evaluation succeeded');
       
       break; // Success, exit retry loop
       
     } catch (err) {
-      console.error(`[Evaluation] Attempt ${evaluationAttempts} failed:`, err.message);
+      log.warn({ err, attempt: evaluationAttempts }, 'Evaluation attempt failed');
       
       if (evaluationAttempts >= maxRetries) {
-        // Final fallback after all retries failed
-        console.warn(`[Evaluation] All ${maxRetries} attempts failed. Using fallback evaluation.`);
+        // Final fallback after all retries failed — use 0/null to avoid polluting averages
+        log.warn({ maxRetries }, 'All attempts failed. Using zeroed fallback evaluation.');
         evaluationResult = {
-          overallScore: 75,
-          creativity: 75,
-          feasibility: 75,
-          proactivity: 75,
-          summary: 'Evaluation completed. Review conversation for detailed insights. (Note: Automated evaluation encountered issues)',
-          strengths: ['Active participation', 'Clear communication'],
-          improvements: ['Further detail could enhance responses'],
-          reasoning: 'Fallback evaluation used due to evaluation service unavailability',
-          confidence: 50
+          simplification: 0,
+          originality: 0,
+          feasibility: 0,
+          criticalThinking: 0,
+          proactivity: 0,
+          impact: 0,
+          summary: null,
+          strengths: [],
+          improvements: [],
+          reasoning: null,
+          confidence: 0,
+          problem_summary: null,
+          solution_summary: null,
+          problem_cluster: null,
+          solution_cluster: null,
+          problem_key: null,
+          problem_topic: null,
+          solution_key: null,
+          solution_topic: null,
+          overallScore: 0
         };
       } else {
         // Wait before retry (exponential backoff)
-        const waitTime = Math.pow(2, evaluationAttempts) * 1000; // 2s, 4s, 8s
-        console.log(`[Evaluation] Retrying in ${waitTime}ms...`);
+        const waitTime = Math.pow(2, evaluationAttempts) * 500; // 1s, 2s
+        log.info({ waitTime }, 'Retrying evaluation');
         await new Promise(resolve => setTimeout(resolve, waitTime));
       }
     }
@@ -645,9 +728,13 @@ IMPORTANT: All scores must be integers between 0 and 100.`;
       kpis: {
         final: evaluationResult.overallScore,
         components: {
-          creativity: evaluationResult.creativity,
+          simplification: evaluationResult.simplification,
+          originality: evaluationResult.originality,
           feasibility: evaluationResult.feasibility,
-          proactivity: evaluationResult.proactivity
+          criticalThinking: evaluationResult.criticalThinking,
+          proactivity: evaluationResult.proactivity,
+          impact: evaluationResult.impact,
+          creativity: evaluationResult.originality
         }
       }
     }
@@ -668,13 +755,16 @@ IMPORTANT: All scores must be integers between 0 and 100.`;
     kpis: {
       final: evaluationResult.overallScore,
       components: {
-        creativity: evaluationResult.creativity,
+        simplification: evaluationResult.simplification,
+        originality: evaluationResult.originality,
         feasibility: evaluationResult.feasibility,
-        proactivity: evaluationResult.proactivity
+        criticalThinking: evaluationResult.criticalThinking,
+        proactivity: evaluationResult.proactivity,
+        impact: evaluationResult.impact,
+        creativity: evaluationResult.originality
       },
       strengths: evaluationResult.strengths,
       improvements: evaluationResult.improvements,
-      // Add evaluation metadata
       evaluationMetadata: {
         confidence: evaluationResult.confidence,
         reasoning: evaluationResult.reasoning,
@@ -682,65 +772,25 @@ IMPORTANT: All scores must be integers between 0 and 100.`;
         messageCount: testAttempt.messageCount,
         evaluationAttempts: evaluationAttempts,
         modelVersion: evaluationModel,
-        promptVersion: (userTest.test.settings && userTest.test.settings.promptVersion) ? String(userTest.test.settings.promptVersion) : '1.0',
         scoringVersion: 'ckpi-v1'
       }
     },
     detailedAnalysis: {
       messageCount: testAttempt.messageCount,
       totalTime: totalTime,
-      conversationSummary: conversationSummary.substring(0, 5000), // Limit size
+      conversationSummary: conversationSummary.substring(0, 5000),
       evaluationConfidence: evaluationResult.confidence,
-      evaluationReasoning: evaluationResult.reasoning
+      evaluationReasoning: evaluationResult.reasoning,
+      problem_summary: evaluationResult.problem_summary || null,
+      solution_summary: evaluationResult.solution_summary || null,
+      problem_cluster: evaluationResult.problem_cluster || null,
+      solution_cluster: evaluationResult.solution_cluster || null,
+      problem_key: evaluationResult.problem_key || null,
+      problem_topic: evaluationResult.problem_topic || null,
+      solution_key: evaluationResult.solution_key || null,
+      solution_topic: evaluationResult.solution_topic || null
     }
   };
-  try {
-    const summaryJson = await evaluateAnswer({
-      model: process.env.OPENAI_EVAL_MODEL || 'gpt-4o-mini',
-      messages: [
-        { 
-          role: 'system', 
-          content: 'Return JSON with keys: problem_summary, solution_summary, problem_cluster, solution_cluster, problem_key, problem_topic, solution_key, solution_topic. ' +
-                   'Keys should be stable slugs (e.g. "INTERNAL_COMM"), topics should be human-readable titles.' 
-        },
-        { role: 'user', content: `Summarize and categorize:\n${conversationSummary.substring(0, 6000)}` }
-      ],
-      temperature: 0.2,
-      max_tokens: 600
-    });
-    if (summaryJson && typeof summaryJson === 'object') {
-      reportData.detailedAnalysis.problem_summary = summaryJson.problem_summary || null;
-      reportData.detailedAnalysis.solution_summary = summaryJson.solution_summary || null;
-      reportData.detailedAnalysis.problem_cluster = summaryJson.problem_cluster || null;
-      reportData.detailedAnalysis.solution_cluster = summaryJson.solution_cluster || null;
-      // Stable keys and topics for aggregation
-      reportData.detailedAnalysis.problem_key = summaryJson.problem_key || summaryJson.problem_cluster || 'UNKNOWN';
-      reportData.detailedAnalysis.problem_topic = summaryJson.problem_topic || summaryJson.problem_cluster || 'Unknown Problem';
-      reportData.detailedAnalysis.solution_key = summaryJson.solution_key || summaryJson.solution_cluster || 'UNKNOWN';
-      reportData.detailedAnalysis.solution_topic = summaryJson.solution_topic || summaryJson.solution_cluster || 'Unknown Solution';
-    }
-  } catch (e) {}
-
-  try {
-    const ckpiJson = await evaluateAnswer({
-      model: process.env.OPENAI_EVAL_MODEL || 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: 'Return JSON with integer keys: overall, simplification, originality, feasibility, criticalThinking, proactivity. Range 0-100.' },
-        { role: 'user', content: conversationSummary.substring(0, 6000) }
-      ],
-      temperature: 0.2,
-      max_tokens: 400
-    });
-    if (ckpiJson && typeof ckpiJson === 'object') {
-      const clamp = (n) => Math.max(0, Math.min(100, Math.round(n)));
-      if (typeof ckpiJson.simplification === 'number') reportData.kpis.components.simplification = clamp(ckpiJson.simplification);
-      if (typeof ckpiJson.originality === 'number') reportData.kpis.components.originality = clamp(ckpiJson.originality);
-      if (typeof ckpiJson.criticalThinking === 'number') reportData.kpis.components.criticalThinking = clamp(ckpiJson.criticalThinking);
-      if (typeof ckpiJson.feasibility === 'number') reportData.kpis.components.feasibility = clamp(ckpiJson.feasibility);
-      if (typeof ckpiJson.proactivity === 'number') reportData.kpis.components.proactivity = clamp(ckpiJson.proactivity);
-      if (typeof ckpiJson.overall === 'number') reportData.kpis.final = clamp(ckpiJson.overall);
-    }
-  } catch (e) {}
 
   if (existingReport) {
     await prisma.report.update({
@@ -754,6 +804,12 @@ IMPORTANT: All scores must be integers between 0 and 100.`;
         ...reportData
       }
     });
+  }
+
+  // Extract team problems and solutions from evaluation (fire-and-forget)
+  if (userTest.companyId && evaluationResult) {
+    teamService.extractFromEvaluation(evaluationResult, userTest.companyId, user.id)
+      .catch(err => log.warn({ err }, 'Failed to extract team problems'));
   }
 
   // Update user test status with completion time
@@ -776,62 +832,87 @@ IMPORTANT: All scores must be integers between 0 and 100.`;
 
 /**
  * Validate and normalize evaluation results
- * Ensures all scores are within 0-100 range and all required fields exist
+ * Ensures all 6 CKPI scores are within 0-100 range and computes overallScore as their average.
  */
 function validateAndNormalizeEvaluation(evaluation) {
   if (!evaluation || typeof evaluation !== 'object') {
     throw new Error('Invalid evaluation result: not an object');
   }
 
-  // Helper to clamp score between 0-100
   const clampScore = (score, fieldName) => {
     if (typeof score !== 'number' || isNaN(score)) {
-      console.warn(`[Validation] Invalid ${fieldName} score: ${score}, defaulting to 75`);
-      return 75;
+      logger.warn({ fieldName, score }, 'Invalid score, defaulting to 0');
+      return 0;
     }
     return Math.max(0, Math.min(100, Math.round(score)));
   };
 
-  // Validate and normalize all scores
+  const ckpiKeys = ['simplification', 'originality', 'feasibility', 'criticalThinking', 'proactivity', 'impact'];
+
+  const components = {};
+  for (const key of ckpiKeys) {
+    components[key] = clampScore(evaluation[key], key);
+  }
+
+  // Compute overallScore as the average of all 6 CKPI dimensions
+  const overallScore = Math.round(
+    ckpiKeys.reduce((sum, key) => sum + components[key], 0) / ckpiKeys.length
+  );
+
   const validated = {
-    overallScore: clampScore(evaluation.overallScore, 'overallScore'),
-    creativity: clampScore(evaluation.creativity, 'creativity'),
-    feasibility: clampScore(evaluation.feasibility, 'feasibility'),
-    proactivity: clampScore(evaluation.proactivity, 'proactivity'),
+    simplification: components.simplification,
+    originality: components.originality,
+    feasibility: components.feasibility,
+    criticalThinking: components.criticalThinking,
+    proactivity: components.proactivity,
+    impact: components.impact,
+    overallScore,
+    // Legacy alias for backward compatibility
+    creativity: components.originality,
     summary: typeof evaluation.summary === 'string' && evaluation.summary.trim()
       ? evaluation.summary.trim()
-      : 'Evaluation completed. Review conversation for detailed insights.',
+      : null,
     strengths: Array.isArray(evaluation.strengths) && evaluation.strengths.length > 0
       ? evaluation.strengths.filter(s => typeof s === 'string' && s.trim()).slice(0, 5)
-      : ['Active participation', 'Clear communication'],
+      : [],
     improvements: Array.isArray(evaluation.improvements) && evaluation.improvements.length > 0
       ? evaluation.improvements.filter(i => typeof i === 'string' && i.trim()).slice(0, 5)
-      : ['Further detail could enhance responses'],
+      : [],
     reasoning: typeof evaluation.reasoning === 'string' && evaluation.reasoning.trim()
       ? evaluation.reasoning.trim()
-      : 'Evaluation based on conversation analysis',
-    confidence: clampScore(evaluation.confidence || 85, 'confidence')
+      : null,
+    confidence: clampScore(evaluation.confidence || 0, 'confidence'),
+    problem_summary: typeof evaluation.problem_summary === 'string' && evaluation.problem_summary.trim()
+      ? evaluation.problem_summary.trim()
+      : null,
+    solution_summary: typeof evaluation.solution_summary === 'string' && evaluation.solution_summary.trim()
+      ? evaluation.solution_summary.trim()
+      : null,
+    problem_cluster: typeof evaluation.problem_cluster === 'string' && evaluation.problem_cluster.trim()
+      ? evaluation.problem_cluster.trim()
+      : null,
+    solution_cluster: typeof evaluation.solution_cluster === 'string' && evaluation.solution_cluster.trim()
+      ? evaluation.solution_cluster.trim()
+      : null,
+    problem_key: typeof evaluation.problem_key === 'string' && evaluation.problem_key.trim()
+      ? evaluation.problem_key.trim()
+      : null,
+    problem_topic: typeof evaluation.problem_topic === 'string' && evaluation.problem_topic.trim()
+      ? evaluation.problem_topic.trim()
+      : null,
+    solution_key: typeof evaluation.solution_key === 'string' && evaluation.solution_key.trim()
+      ? evaluation.solution_key.trim()
+      : null,
+    solution_topic: typeof evaluation.solution_topic === 'string' && evaluation.solution_topic.trim()
+      ? evaluation.solution_topic.trim()
+      : null
   };
 
-  // Log validation warnings if any
-  if (evaluation.overallScore !== validated.overallScore ||
-      evaluation.creativity !== validated.creativity ||
-      evaluation.feasibility !== validated.feasibility ||
-      evaluation.proactivity !== validated.proactivity) {
-    console.warn('[Validation] Scores were adjusted:', {
-      original: {
-        overallScore: evaluation.overallScore,
-        creativity: evaluation.creativity,
-        feasibility: evaluation.feasibility,
-        proactivity: evaluation.proactivity
-      },
-      validated: {
-        overallScore: validated.overallScore,
-        creativity: validated.creativity,
-        feasibility: validated.feasibility,
-        proactivity: validated.proactivity
-      }
-    });
+  const adjusted = ckpiKeys.some(key => evaluation[key] !== validated[key]);
+  if (adjusted) {
+    const originalScores = ckpiKeys.reduce((o, key) => { o[key] = evaluation[key]; return o; }, {});
+    const validatedScores = ckpiKeys.reduce((o, key) => { o[key] = validated[key]; return o; }, { overallScore });
+    logger.warn({ original: originalScores, validated: validatedScores }, 'CKPI scores were adjusted');
   }
 
   return validated;
@@ -867,8 +948,28 @@ function buildComponentsFromToolOutputs(toolOutputs = []) {
   return Object.keys(result).length ? result : null;
 }
 
+// Heartbeat — called by frontend during active test to keep it alive
+async function heartbeat({ userTestId, userId }) {
+  const userTest = await prisma.userTest.findFirst({
+    where: { id: userTestId, userId, status: 'IN_PROGRESS' },
+    include: { attempts: { orderBy: { createdAt: 'desc' }, take: 1 } }
+  });
+  if (!userTest) return { found: false };
+  const attempt = userTest.attempts[0];
+  if (!attempt) return { found: true, completed: false };
+
+  // Touch the attempt to keep it alive
+  await prisma.testAttempt.update({
+    where: { id: attempt.id },
+    data: {}
+  });
+
+  return { found: true, completed: false };
+}
+
 module.exports = {
   startTestConversation,
   handleUserMessage,
-  completeTest
+  completeTest,
+  heartbeat
 };

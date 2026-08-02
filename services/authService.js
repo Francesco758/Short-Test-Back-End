@@ -6,15 +6,17 @@ const SECRET = process.env.JWT_SECRET || 'devsecret';
 const TOKEN_EXPIRES = process.env.JWT_EXPIRES_IN || '7d';
 
 async function register(payload) {
-  const { email, password, name, companyName, role } = payload;
-  
+  const { email, password, name, companyName, organizationType, organizationSize, country, role } = payload;
+
   if (!email || !password) {
     const err = new Error('Email and password are required');
     err.status = 400;
     throw err;
   }
 
-  const existingUser = await prisma.user.findUnique({ where: { email: email.trim() } });
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const existingUser = await prisma.user.findFirst({ where: { email: normalizedEmail } });
   if (existingUser) {
     const err = new Error('User already exists');
     err.status = 409;
@@ -23,7 +25,7 @@ async function register(payload) {
 
   let companyId = null;
   let companyData = null;
-  
+
   // If company name provided, create company and set user as COMPANY_ADMIN
   if (companyName) {
     const existingCompany = await prisma.company.findUnique({ where: { name: companyName } });
@@ -32,7 +34,21 @@ async function register(payload) {
       err.status = 409;
       throw err;
     }
-    const company = await prisma.company.create({ data: { name: companyName } });
+
+    // Validate organizationType if provided, default to COMPANY
+    const validOrgTypes = ['COMPANY', 'TEAM', 'UNIVERSITY', 'CLASSROOM'];
+    const orgType = organizationType && validOrgTypes.includes(organizationType.toUpperCase())
+      ? organizationType.toUpperCase()
+      : 'COMPANY';
+
+    const company = await prisma.company.create({
+      data: {
+        name: companyName,
+        organizationType: orgType,
+        organizationSize: organizationSize || null,
+        country: country || null
+      }
+    });
     companyId = company.id;
     companyData = company;
   }
@@ -55,7 +71,7 @@ async function register(payload) {
 
   const newUser = await prisma.user.create({
     data: {
-      email: email.trim(),
+      email: normalizedEmail,
       password: hashedPassword,
       role: userRole,
       name: name ? name.trim() : null,
@@ -73,6 +89,42 @@ async function register(payload) {
   };
 
   const token = jwt.sign(tokenPayload, SECRET, { expiresIn: TOKEN_EXPIRES });
+
+  // Auto-assign "Custom Test" and "Problem Solution Discovery" to newly registered companies
+  if (companyId) {
+    try {
+      const autoAssignTests = await prisma.test.findMany({
+        where: {
+          title: { in: ['Custom Test', 'Problem Solution Discovery'] },
+          deletedAt: null
+        }
+      });
+
+      for (const test of autoAssignTests) {
+        const alreadyAssigned = await prisma.companyTest.findUnique({
+          where: {
+            companyId_testId: {
+              companyId: companyId,
+              testId: test.id
+            }
+          }
+        });
+
+        if (!alreadyAssigned) {
+          await prisma.companyTest.create({
+            data: {
+              testId: test.id,
+              companyId: companyId,
+              assignedById: newUser.id
+            }
+          });
+        }
+      }
+    } catch (autoAssignErr) {
+      // Silently fail - don't block registration if auto-assignment fails
+      console.error('Auto-assignment error:', autoAssignErr);
+    }
+  }
 
   const { password: _, ...safeUser } = newUser;
   const userResponse = { ...safeUser, company: companyData || newUser.company || null };
@@ -92,8 +144,10 @@ async function login(payload) {
     throw err;
   }
 
-  const user = await prisma.user.findUnique({ 
-    where: { email: email.trim() }, 
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const user = await prisma.user.findFirst({ 
+    where: { email: normalizedEmail }, 
     include: { company: true } 
   });
   
@@ -201,9 +255,71 @@ async function changePassword(userId, payload) {
   };
 }
 
+async function guestLogin(payload) {
+  const { name, companyId } = payload;
+
+  if (!name || !name.trim()) {
+    const err = new Error('Name is required');
+    err.status = 400;
+    throw err;
+  }
+
+  if (!companyId) {
+    const err = new Error('Company ID is required');
+    err.status = 400;
+    throw err;
+  }
+
+  const normalizedGuestName = name.trim().replace(/\s+/g, ' ').toLowerCase();
+  const cId = parseInt(companyId);
+
+  // Check if guest with same name + company already exists (reuse it)
+  let guestUser = await prisma.user.findFirst({
+    where: { name: normalizedGuestName, companyId: cId, isGuest: true, deletedAt: null },
+    include: { company: true }
+  });
+
+  if (!guestUser) {
+    // Generate a unique synthetic email
+    const shortId = Math.random().toString(36).substring(2, 8);
+    const syntheticEmail = `guest_${cId}_${shortId}@rplt.guest`;
+
+    guestUser = await prisma.user.create({
+      data: {
+        email: syntheticEmail,
+        name: normalizedGuestName,
+        role: 'GUEST',
+        isGuest: true,
+        companyId: cId
+      },
+      include: { company: true }
+    });
+  }
+
+  // Update last login
+  await prisma.user.update({
+    where: { id: guestUser.id },
+    data: { lastLoginAt: new Date() }
+  });
+
+  const tokenPayload = {
+    id: guestUser.id,
+    email: guestUser.email,
+    role: guestUser.role,
+    companyId: guestUser.companyId,
+    isGuest: true
+  };
+
+  const token = jwt.sign(tokenPayload, SECRET, { expiresIn: TOKEN_EXPIRES });
+
+  const { password: _, ...safeUser } = guestUser;
+  return { token, user: safeUser, message: 'Guest login successful' };
+}
+
 module.exports = { 
   register, 
   login, 
   getMe, 
-  changePassword 
+  changePassword,
+  guestLogin
 };

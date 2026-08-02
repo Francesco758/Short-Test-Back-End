@@ -2,6 +2,7 @@ const { prisma } = require('../../utils/prismaClient');
 
 const OPENAI_API_KEY_KEY = 'openai_api_key';
 const OPENAI_MODEL_KEY = 'openai_model';
+const TRANSFORMACHINE_PROMPT_KEY = 'transformachine_prompt';
 
 async function getOpenAIConfig() {
   const settings = await prisma.systemSetting.findMany({
@@ -37,4 +38,33 @@ async function updateOpenAIConfig({ apiKey, model }) {
   return { ok: true };
 }
 
-module.exports = { getOpenAIConfig, updateOpenAIConfig };
+async function getTransforMachinePrompt() {
+  const setting = await prisma.systemSetting.findUnique({
+    where: { key: TRANSFORMACHINE_PROMPT_KEY }
+  });
+  return {
+    prompt: setting?.value || ''
+  };
+}
+
+async function updateTransforMachinePrompt({ prompt }) {
+  if (prompt && typeof prompt === 'string') {
+    await prisma.systemSetting.upsert({
+      where: { key: TRANSFORMACHINE_PROMPT_KEY },
+      update: { value: prompt.trim() },
+      create: { key: TRANSFORMACHINE_PROMPT_KEY, value: prompt.trim() }
+    });
+  } else {
+    // If empty string, delete the setting
+    try {
+      await prisma.systemSetting.delete({
+        where: { key: TRANSFORMACHINE_PROMPT_KEY }
+      });
+    } catch {
+      // Ignore if not found
+    }
+  }
+  return { ok: true };
+}
+
+module.exports = { getOpenAIConfig, updateOpenAIConfig, getTransforMachinePrompt, updateTransforMachinePrompt };

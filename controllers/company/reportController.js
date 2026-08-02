@@ -37,6 +37,14 @@ async function getProblemSolutionOverview(req, res, next) {
   } catch (err) { next(err); }
 }
 
+async function getLatestUserTestReportByUserId(req, res, next) {
+  try {
+    const userId = parseInt(req.params.userId);
+    const result = await reportService.getLatestUserTestReportByUserId(req.user.companyId, userId);
+    res.json(result);
+  } catch (err) { next(err); }
+}
+
 async function getUpcomingDeadlines(req, res, next) {
   try {
     const rows = await reportService.getUpcomingDeadlines(req.user.companyId);
@@ -46,11 +54,11 @@ async function getUpcomingDeadlines(req, res, next) {
 
 async function queryCompanyData(req, res, next) {
   try {
-    const { question } = req.body;
+    const { question, history } = req.body;
     if (!question || !question.trim()) {
       return res.status(400).json({ error: 'question is required' });
     }
-    const result = await reportService.queryCompanyData(req.user.companyId, question.trim());
+    const result = await reportService.queryCompanyData(req.user.companyId, question.trim(), req.user, history || []);
     res.json(result);
   } catch (err) { next(err); }
 }
@@ -62,6 +70,14 @@ async function getCompanyCKPIMetrics(req, res, next) {
   } catch (err) { next(err); }
 }
 
+async function getUserGlobalSummary(req, res, next) {
+  try {
+    const userId = parseInt(req.params.userId);
+    const summary = await reportService.getUserGlobalSummary(userId);
+    res.json({ summary });
+  } catch (err) { next(err); }
+}
+
 module.exports = { 
   getUserReports, 
   getUserTestReport, 
@@ -69,5 +85,7 @@ module.exports = {
   getProblemSolutionOverview,
   getUpcomingDeadlines,
   queryCompanyData,
-  getCompanyCKPIMetrics
+  getCompanyCKPIMetrics,
+  getLatestUserTestReportByUserId,
+  getUserGlobalSummary
 };

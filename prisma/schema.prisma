@@ -9,10 +9,11 @@ datasource db {
 
 model User {
   id                     Int           @id @default(autoincrement())
-  email                  String        @unique
-  password               String
+  email                  String?
+  password               String?
   role                   Role
   name                   String?
+  isGuest                Boolean       @default(false)
   companyId              Int?
   createdByAdmin         Boolean       @default(false)
   createdById            Int?
@@ -22,6 +23,7 @@ model User {
   deletedAt              DateTime?
   function               String?
   seniorityBand          String?
+  dateOfBirth            DateTime?
   companyTestAssignments CompanyTest[]
   tests                  Test[]        @relation("UserTests")
   company                Company?      @relation(fields: [companyId], references: [id])
@@ -29,23 +31,38 @@ model User {
   createdUsers           User[]        @relation("UserCreatesUsers")
   assignedTests          UserTest[]
 
+  aiUsageRecords   AiUsage[]
+  teamProblems     TeamProblem[]
+  teamSolutions    TeamSolution[]
+  solutionLikes    SolutionLike[]
+
   @@index([companyId])
   @@index([email])
   @@index([role])
+  @@index([companyId, deletedAt])
+  @@index([isGuest])
+  @@index([name, companyId, isGuest])
 }
 
 model Company {
-  id            Int           @id @default(autoincrement())
-  name          String        @unique
-  description   String?
-  isActive      Boolean       @default(true)
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
-  deletedAt     DateTime?
-  assignedTests CompanyTest[]
-  tests         Test[]        @relation("CompanyTests")
-  users         User[]
-  userTests     UserTest[]
+  id               Int           @id @default(autoincrement())
+  name             String        @unique
+  description      String?
+  organizationType OrganizationType @default(COMPANY)
+  organizationSize String?
+  country          String?
+  isActive         Boolean       @default(true)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  deletedAt        DateTime?
+  assignedTests    CompanyTest[]
+  tests            Test[]        @relation("CompanyTests")
+  users            User[]
+  userTests        UserTest[]
+  aiUsageRecords   AiUsage[]
+  teamProblems     TeamProblem[]
+  teamSolutions    TeamSolution[]
+  reportEmbeddings   ReportEmbedding[]
 }
 
 model Test {
@@ -78,6 +95,7 @@ model CompanyTest {
   testId       Int
   assignedAt   DateTime @default(now())
   assignedById Int
+  guestAccess  Boolean  @default(false)
   assignedBy   User     @relation(fields: [assignedById], references: [id])
   company      Company  @relation(fields: [companyId], references: [id])
   test         Test     @relation(fields: [testId], references: [id])
@@ -85,6 +103,7 @@ model CompanyTest {
   @@unique([companyId, testId])
   @@index([companyId])
   @@index([testId])
+  @@index([guestAccess])
 }
 
 model UserTest {
@@ -109,6 +128,10 @@ model UserTest {
   @@index([testId])
   @@index([companyId])
   @@index([status])
+  @@index([userId, status])
+  @@index([companyId, assignedAt])
+  @@index([companyId, status])
+  @@index([companyId, status, deadline])
 }
 
 model TestAttempt {
@@ -156,6 +179,7 @@ model Report {
   userTest         UserTest @relation(fields: [userTestId], references: [id])
 
   @@index([userTestId])
+  @@index([createdAt])
 }
 
 model GPTMessage {
@@ -176,12 +200,122 @@ model SystemSetting {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+model AiUsage {
+  id               Int      @id @default(autoincrement())
+  userId           Int?
+  companyId        Int?
+  source           String
+  model            String
+  promptTokens     Int
+  completionTokens Int
+  totalTokens      Int
+  estimatedCostUsd Float
+  metadata         Json?
+  createdAt        DateTime @default(now())
+
+  user    User?    @relation(fields: [userId], references: [id])
+  company Company? @relation(fields: [companyId], references: [id])
+
+  @@index([userId])
+  @@index([companyId])
+  @@index([source])
+  @@index([createdAt])
+}
+model TeamProblem {
+  id            Int           @id @default(autoincrement())
+  companyId     Int
+  key           String
+  topic         String
+  description   String        @db.Text
+  frequency     Int           @default(0)
+  source        String        @default("evaluation")
+  createdById   Int
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  clusterId     String?
+  clusterLabel  String?
+
+  company       Company       @relation(fields: [companyId], references: [id])
+  createdBy     User          @relation(fields: [createdById], references: [id])
+  solutions     TeamSolution[]
+
+  @@unique([companyId, key])
+  @@index([companyId])
+  @@index([frequency])
+  @@index([clusterId])
+}
+
+model TeamSolution {
+  id            Int           @id @default(autoincrement())
+  companyId     Int
+  problemId     Int?
+  key           String
+  topic         String
+  description   String        @db.Text
+  source        String        @default("evaluation")
+  createdById   Int
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  clusterId     String?
+  clusterLabel  String?
+
+  company       Company       @relation(fields: [companyId], references: [id])
+  problem       TeamProblem?  @relation(fields: [problemId], references: [id])
+  createdBy     User          @relation(fields: [createdById], references: [id])
+  likes         SolutionLike[]
+
+  @@unique([companyId, key])
+  @@index([companyId])
+  @@index([createdAt])
+  @@index([clusterId])
+}
+
+model ReportEmbedding {
+  id         Int      @id @default(autoincrement())
+  companyId  Int?
+  reportId   Int
+  type       String
+  key        String
+  topic      String
+  summary    String   @db.Text
+  embedding  String   @db.Text
+  createdAt  DateTime @default(now())
+
+  company    Company? @relation(fields: [companyId], references: [id])
+
+  @@unique([reportId, type])
+  @@index([companyId])
+  @@index([companyId, type])
+}
+
+model SolutionLike {
+  id            Int           @id @default(autoincrement())
+  solutionId    Int
+  userId        Int
+  createdAt     DateTime      @default(now())
+
+  solution      TeamSolution  @relation(fields: [solutionId], references: [id], onDelete: Cascade)
+  user          User          @relation(fields: [userId], references: [id])
+
+  @@unique([solutionId, userId])
+  @@index([solutionId])
+}
+
+enum OrganizationType {
+  COMPANY
+  TEAM
+  UNIVERSITY
+  CLASSROOM
+}
+
 enum Role {
   SUPER_ADMIN
   COMPANY_ADMIN
   USER
   STUDENT
   TEACHER
+  GUEST
 }
 
 enum TestStatus {

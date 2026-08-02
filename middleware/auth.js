@@ -71,7 +71,15 @@ function requireRole(roles) {
 
 // Role-specific middleware
 const superAdminOnly = requireRole(['SUPER_ADMIN']);
-const companyAdminOnly = requireRole(['COMPANY_ADMIN']);
+const companyAdminOnly = [
+  requireRole(['COMPANY_ADMIN']),
+  (req, res, next) => {
+    if (req.user?.isGuest) {
+      return sendError(res, 403, 'Insufficient permissions');
+    }
+    next();
+  }
+];
 const adminOnly = requireRole(['SUPER_ADMIN', 'COMPANY_ADMIN']);
 
 // Company tenant isolation middleware

@@ -1,4 +1,5 @@
 const conversationService = require('../services/conversationServiceSimplified');
+const logger = require('../utils/logger');
 
 module.exports = {
   /**
@@ -9,7 +10,8 @@ module.exports = {
     try {
       const result = await conversationService.startTestConversation({
         user: req.user,
-        body: req.body
+        body: req.body,
+        requestId: req.id
       });
       return res.json(result);
     } catch (err) {
@@ -25,7 +27,8 @@ module.exports = {
     try {
       const result = await conversationService.handleUserMessage({
         user: req.user,
-        body: req.body
+        body: req.body,
+        requestId: req.id
       });
       return res.json(result);
     } catch (err) {
@@ -46,7 +49,28 @@ module.exports = {
 
       const result = await conversationService.completeTest({
         user: req.user,
-        userTestId
+        userTestId,
+        requestId: req.id
+      });
+      return res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  /**
+   * Heartbeat — user is still active on the test
+   * POST /api/conversation/heartbeat
+   */
+  heartbeat: async (req, res, next) => {
+    try {
+      const { userTestId } = req.body;
+      if (!userTestId) {
+        return res.status(400).json({ error: 'userTestId is required' });
+      }
+      const result = await conversationService.heartbeat({
+        userTestId,
+        userId: req.user.id
       });
       return res.json(result);
     } catch (err) {

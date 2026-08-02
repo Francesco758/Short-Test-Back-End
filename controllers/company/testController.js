@@ -69,8 +69,37 @@ async function bulkAssignTests(req, res, next) {
   }
 }
 
+async function toggleGuestAccess(req, res, next) {
+  try {
+    const { enabled } = req.body;
+    const result = await testService.setGuestAccess({
+      testId: parseInt(req.params.testId),
+      companyId: req.user.companyId,
+      enabled: enabled === true
+    });
+    res.json({
+      success: true,
+      message: enabled ? 'Guest access enabled for this test' : 'Guest access disabled for this test',
+      data: result
+    });
+  } catch (err) { 
+    next(err); 
+  }
+}
+
+async function getGuestAccessCompanies(req, res, next) {
+  try {
+    const companies = await testService.getGuestAccessCompanies();
+    res.json(companies);
+  } catch (err) { 
+    next(err); 
+  }
+}
+
 module.exports = { 
   getAssignedTests, 
   assignTestToUsers, 
-  bulkAssignTests 
+  bulkAssignTests,
+  toggleGuestAccess,
+  getGuestAccessCompanies
 };
