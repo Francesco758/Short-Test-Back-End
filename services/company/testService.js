@@ -55,7 +55,8 @@ async function assignTestToUsers({ testId, userIds, companyId, notify = true, sc
     companyId,
     assignedAt: scheduleAt ? new Date(scheduleAt) : new Date(),
     brief: companyTest.test.isCustom ? (brief || null) : null,
-    deadline: deadline ? new Date(deadline) : null
+    deadline: deadline ? new Date(deadline) : null,
+    source: 'manager'
   }));
   
   const result = await prisma.userTest.createMany({
@@ -117,7 +118,8 @@ async function bulkAssignTests({ testIds, userIds, companyId, notify = true, sch
         testId, 
         companyId,
         assignedAt: scheduleAt ? new Date(scheduleAt) : new Date(),
-        deadline: deadline ? new Date(deadline) : null
+        deadline: deadline ? new Date(deadline) : null,
+        source: 'manager'
       });
     }
   }
@@ -176,54 +178,101 @@ async function sendBulkAssignmentEmails(users, tests, companyName) {
   }
 }
 
-async function setGuestAccess({ testId, companyId, enabled }) {
-  const companyTest = await prisma.companyTest.findFirst({
-    where: { testId, companyId }
-  });
-
-  if (!companyTest) {
-    throw new Error('Test not assigned to company');
-  }
-
-  const updated = await prisma.companyTest.update({
-    where: { id: companyTest.id },
-    data: { guestAccess: enabled },
-    include: { test: true }
-  });
-
-  return updated;
-}
-
 async function getGuestAccessCompanies() {
-  const companyTests = await prisma.companyTest.findMany({
-    where: { guestAccess: true },
-    include: {
-      company: { select: { id: true, name: true } },
-      test: { select: { id: true, title: true } }
-    },
-    distinct: ['companyId']
+  const companies = await prisma.company.findMany({
+    where: { guestMode: true, deletedAt: null },
+    select: { id: true, name: true },
+    orderBy: { name: 'asc' }
   });
-
-  // Deduplicate by company
-  const seen = new Set();
-  const companies = [];
-  for (const ct of companyTests) {
-    if (!seen.has(ct.company.id)) {
-      seen.add(ct.company.id);
-      companies.push({
-        id: ct.company.id,
-        name: ct.company.name
-      });
-    }
-  }
 
   return companies;
+}
+
+/**
+ * Guest mode is a company-level switch (Company.guestMode), independent of any
+ * test. Turning it ON only lets people log in as guests; guests then start any
+ * active company shorTest from their own "Start a shorTest" flow, exactly like
+ * a regular user. Turning it OFF also revokes their in-flight work (see below).
+ */
+async function getCompanyGuestAccess(companyId) {
+  const company = await prisma.company.findUnique({
+    where: { id: companyId },
+    select: { id: true, guestMode: true }
+  });
+  return { active: company?.guestMode === true };
+}
+
+async function setCompanyGuestAccess(companyId, enabled) {
+  const company = await prisma.company.update({
+    where: { id: companyId },
+    data: { guestMode: enabled === true },
+    select: { id: true, name: true, guestMode: true }
+  });
+  return { active: company.guestMode === true };
+}
+
+/**
+ * Turn guest mode off for the company.
+ * - Company.guestMode goes false, so the public guest-companies list stops
+ *   offering the company on the login page and new guest logins are rejected.
+ * - Untouched guest assignments (ASSIGNED, never started, no attempt/report)
+ *   are deleted: those are empty placeholders.
+ * - Started-but-unfinished guest assignments (IN_PROGRESS) keep all their
+ *   attempt/conversation data and are only marked EXPIRED, which removes them
+ *   from every list query (all of them filter on explicit status sets).
+ * - COMPLETED guest tests and their reports are never touched.
+ */
+async function deactivateGuestMode(companyId) {
+  return prisma.$transaction(async (tx) => {
+    await tx.company.update({
+      where: { id: companyId },
+      data: { guestMode: false }
+    });
+
+    const result = {
+      removedAssignments: 0,
+      expiredAssignments: 0,
+      keptCompleted: 0
+    };
+
+    const removed = await tx.userTest.deleteMany({
+      where: {
+        companyId,
+        status: 'ASSIGNED',
+        startedAt: null,
+        completedAt: null,
+        user: { isGuest: true },
+        attempts: { none: {} },
+        report: null
+      }
+    });
+    result.removedAssignments = removed.count;
+
+    const expired = await tx.userTest.updateMany({
+      where: {
+        companyId,
+        status: 'IN_PROGRESS',
+        completedAt: null,
+        user: { isGuest: true }
+      },
+      data: { status: 'EXPIRED' }
+    });
+    result.expiredAssignments = expired.count;
+
+    result.keptCompleted = await tx.userTest.count({
+      where: { companyId, status: 'COMPLETED', user: { isGuest: true } }
+    });
+
+    return result;
+  });
 }
 
 module.exports = { 
   getAssignedTests, 
   assignTestToUsers, 
   bulkAssignTests,
-  setGuestAccess,
-  getGuestAccessCompanies
+  getGuestAccessCompanies,
+  getCompanyGuestAccess,
+  setCompanyGuestAccess,
+  deactivateGuestMode
 };

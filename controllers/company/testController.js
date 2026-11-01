@@ -69,17 +69,17 @@ async function bulkAssignTests(req, res, next) {
   }
 }
 
-async function toggleGuestAccess(req, res, next) {
+async function toggleCompanyGuestMode(req, res, next) {
   try {
-    const { enabled } = req.body;
-    const result = await testService.setGuestAccess({
-      testId: parseInt(req.params.testId),
-      companyId: req.user.companyId,
-      enabled: enabled === true
-    });
+    const enabled = req.body?.enabled === true;
+    const result = enabled
+      ? await testService.setCompanyGuestAccess(req.user.companyId, true)
+      : await testService.deactivateGuestMode(req.user.companyId);
     res.json({
       success: true,
-      message: enabled ? 'Guest access enabled for this test' : 'Guest access disabled for this test',
+      message: enabled
+        ? 'Guest mode enabled. Guests can now log in with just a name.'
+        : 'Guest mode deactivated for this company',
       data: result
     });
   } catch (err) { 
@@ -96,10 +96,33 @@ async function getGuestAccessCompanies(req, res, next) {
   }
 }
 
+async function getGuestAccessStatus(req, res, next) {
+  try {
+    const status = await testService.getCompanyGuestAccess(req.user.companyId);
+    res.json(status);
+  } catch (err) { 
+    next(err); 
+  }
+}
+
+async function deactivateGuestMode(req, res, next) {
+  try {
+    const result = await testService.deactivateGuestMode(req.user.companyId);
+    res.json({
+      success: true,
+      message: 'Guest mode deactivated for this company',
+      data: result
+    });
+  } catch (err) { 
+    next(err); 
+  }
+}
+
 module.exports = { 
   getAssignedTests, 
   assignTestToUsers, 
   bulkAssignTests,
-  toggleGuestAccess,
-  getGuestAccessCompanies
+  toggleCompanyGuestMode,
+  getGuestAccessCompanies,
+  getGuestAccessStatus
 };

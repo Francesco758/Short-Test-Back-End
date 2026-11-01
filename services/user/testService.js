@@ -1,15 +1,14 @@
 const { prisma } = require('../../utils/prismaClient');
 const conversationService = require('../conversationServiceSimplified');
+const { ValidationError, NotFoundError, ConflictError } = require('../../utils/errors');
+const { normalizeLaunchSource, normalizeLaunchContext } = require('../../utils/helpers');
 
 async function getAssignedTests(userId) {
-  // Get user to check if guest
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { id: true, isGuest: true, companyId: true }
-  });
-
-  // Fetch regular assignments
-  const assignedTests = await prisma.userTest.findMany({
+  // Same behaviour for employees and guests: guests get no auto-created
+  // assignments. They start any active company shorTest from the self-serve
+  // "Start a shorTest" flow (see getAvailableStandardTests below), so nothing
+  // shows up as pending until they actually launch one.
+  return prisma.userTest.findMany({
     where: { userId, status: { in: ['ASSIGNED', 'IN_PROGRESS', 'COMPLETED'] } },
     include: { 
       test: true,
@@ -26,41 +25,168 @@ async function getAssignedTests(userId) {
     },
     orderBy: { assignedAt: 'desc' }
   });
+}
 
-  // For guests: also auto-create UserTest records for guest-accessible tests
-  if (user?.isGuest && user?.companyId) {
-    const guestAccessible = await prisma.companyTest.findMany({
-      where: { companyId: user.companyId, guestAccess: true },
-      include: { test: true }
-    });
+// ==================== SELF-SERVE STANDARD shorTESTS ====================
+// An employee (or guest) can start a standard shorTest on their own, without a
+// manager assigning it first. Standard shorTests are the company's non-custom
+// ACTIVE tests — the custom test used by the team problems/solutions flow is
+// deliberately excluded.
+// Anti-abuse rule: at most PENDING_TEST_LIMIT incomplete tests per user;
+// completing any one of them frees a slot. "Pending" uses the same definition
+// as the dashboard (anything that is not COMPLETED).
 
-    for (const ct of guestAccessible) {
-      const alreadyHas = assignedTests.some(ut => ut.testId === ct.testId);
-      if (!alreadyHas) {
-        const newUt = await prisma.userTest.create({
-          data: {
-            userId: user.id,
-            testId: ct.testId,
-            companyId: user.companyId,
-            status: 'ASSIGNED',
-            assignedAt: new Date()
-          },
-          include: {
-            test: true,
-            report: true,
-            attempts: {
-              orderBy: { createdAt: 'desc' },
-              take: 1,
-              include: { answers: { orderBy: { createdAt: 'asc' } } }
-            }
-          }
-        });
-        assignedTests.unshift(newUt);
-      }
-    }
+const PENDING_TEST_LIMIT = 5;
+const PENDING_TEST_STATUSES = ['ASSIGNED', 'IN_PROGRESS'];
+
+function summarizePending(userTests) {
+  const pendingCount = userTests.filter(t => PENDING_TEST_STATUSES.includes(t.status)).length;
+  return {
+    pendingCount,
+    pendingLimit: PENDING_TEST_LIMIT,
+    canStartNew: pendingCount < PENDING_TEST_LIMIT
+  };
+}
+
+/**
+ * List the standard shorTests the current user may start, with per-test state
+ * and the pending-test gate.
+ * - Users: every non-custom ACTIVE test assigned to their company.
+ * - Guests: only the tests the company opened to guests (existing behaviour).
+ */
+async function getAvailableStandardTests(user) {
+  if (!user?.companyId) {
+    return { tests: [], ...summarizePending([]) };
   }
 
-  return assignedTests;
+  // Identical for employees and guests: every non-custom ACTIVE test assigned
+  // to the company. Guests are already gated at login (Company.guestMode), so
+  // no per-test filter is needed here.
+  const companyTestWhere = {
+    companyId: user.companyId,
+    test: { isCustom: false, status: 'ACTIVE', deletedAt: null }
+  };
+
+  const [companyTests, userTests] = await Promise.all([
+    prisma.companyTest.findMany({
+      where: companyTestWhere,
+      include: {
+        test: {
+          select: { id: true, title: true, description: true, settings: true }
+        }
+      },
+      orderBy: { assignedAt: 'desc' }
+    }),
+    prisma.userTest.findMany({
+      where: { userId: user.id },
+      select: { id: true, testId: true, status: true, assignedAt: true, startedAt: true, completedAt: true },
+      orderBy: { assignedAt: 'desc' }
+    })
+  ]);
+
+  const tests = companyTests.map((companyTest) => {
+    const mine = userTests.filter(ut => ut.testId === companyTest.test.id);
+    const pending = mine.filter(ut => PENDING_TEST_STATUSES.includes(ut.status));
+    const inProgress = pending.find(ut => ut.status === 'IN_PROGRESS') || null;
+    const completedCount = mine.filter(ut => ut.status === 'COMPLETED').length;
+    const resumable = inProgress || pending[0] || null;
+
+    const state = inProgress
+      ? 'IN_PROGRESS'
+      : (pending.length ? 'PENDING' : (completedCount ? 'COMPLETED' : 'NOT_STARTED'));
+
+    return {
+      testId: companyTest.test.id,
+      title: companyTest.test.title,
+      description: companyTest.test.description,
+      estimatedDuration: companyTest.test.settings?.estimatedDuration || null,
+      state,
+      pendingCount: pending.length,
+      completedCount,
+      resumeUserTestId: resumable ? resumable.id : null
+    };
+  });
+
+  return { tests, ...summarizePending(userTests) };
+}
+
+/**
+ * Start a brand new standard shorTest for the current user.
+ * Creates a fresh UserTest (a new attempt); the existing conversation endpoints
+ * (`POST /api/conversation/start`) then pick it up unchanged, so completion,
+ * evaluation, report generation and company data aggregation are untouched.
+ */
+async function launchStandardTest({ user, testId = null, source = null, context = null }) {
+  if (!user?.companyId) {
+    throw new ValidationError('You need to belong to a company to start a shorTest');
+  }
+
+  const available = await getAvailableStandardTests(user);
+
+  if (!available.tests.length) {
+    throw new NotFoundError('No shorTest is available for you yet. Please contact your admin.');
+  }
+
+  let target = null;
+
+  if (testId !== undefined && testId !== null && String(testId).trim() !== '') {
+    const parsedTestId = parseInt(testId, 10);
+    if (Number.isNaN(parsedTestId)) {
+      throw new ValidationError('testId must be a number');
+    }
+
+    target = available.tests.find(t => t.testId === parsedTestId) || null;
+    if (!target) {
+      throw new NotFoundError('This shorTest is not available for your company');
+    }
+  } else if (available.tests.length === 1) {
+    // Most companies have a single shorTest: no selection needed.
+    target = available.tests[0];
+  } else {
+    const error = new ValidationError('Several shorTests are available. Please choose one.');
+    error.details = {
+      tests: available.tests.map(t => ({ testId: t.testId, title: t.title }))
+    };
+    throw error;
+  }
+
+  // Cap check and creation run inside one transaction so a double click cannot
+  // slip past the pending limit.
+  const created = await prisma.$transaction(async (tx) => {
+    const pendingCount = await tx.userTest.count({
+      where: { userId: user.id, status: { in: PENDING_TEST_STATUSES } }
+    });
+
+    if (pendingCount >= PENDING_TEST_LIMIT) {
+      // NOTE: the code must not start with "P" — the error handler treats
+      // "P*" codes as Prisma error codes.
+      throw new ConflictError(
+        `You already have ${PENDING_TEST_LIMIT} pending tests. Complete at least one to start a new shorTest.`,
+        'TOO_MANY_PENDING_TESTS'
+      );
+    }
+
+    return tx.userTest.create({
+      data: {
+        userId: user.id,
+        testId: target.testId,
+        companyId: user.companyId,
+        status: 'ASSIGNED',
+        assignedAt: new Date(),
+        source: 'self'
+      }
+    });
+  });
+
+  return {
+    userTestId: created.id,
+    testId: target.testId,
+    title: target.title,
+    pendingCount: available.pendingCount + 1,
+    pendingLimit: available.pendingLimit,
+    source: normalizeLaunchSource(source),
+    context: normalizeLaunchContext(context)
+  };
 }
 
 async function startTest(userTestId, userId) {
@@ -71,6 +197,23 @@ async function startTest(userTestId, userId) {
   
   if (!userTest) {
     throw new Error('Test not found or already started');
+  }
+
+  // Guests may only take tests while their company's guest mode is on
+  // (deactivation flips Company.guestMode off, which must immediately stop any
+  // still-logged-in guest from starting or resuming).
+  const owner = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { isGuest: true, companyId: true }
+  });
+  if (owner?.isGuest) {
+    const company = await prisma.company.findUnique({
+      where: { id: owner.companyId },
+      select: { guestMode: true }
+    });
+    if (company?.guestMode !== true) {
+      throw new ValidationError('Guest access is no longer enabled for this company');
+    }
   }
   
   // Create test attempt with phase 1
@@ -368,5 +511,7 @@ module.exports = {
   startTest, 
   submitAnswer, 
   finishTest, 
-  getTestStatus 
+  getTestStatus,
+  getAvailableStandardTests,
+  launchStandardTest
 };

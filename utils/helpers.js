@@ -57,10 +57,69 @@ function generateRandomPassword(length = 8) {
   return password;
 }
 
+/**
+ * Launch attribution helpers.
+ *
+ * These support the self-serve "Start a shorTest" feature: it can be triggered
+ * from the platform itself or, in the future, from external systems
+ * (Teams, Outlook, browser extensions, intranets). The originating system
+ * (`source`) and an optional `context` (e.g. an email subject, an email body,
+ * a Teams message or the selected text) are stored on TestAttempt.metadata,
+ * which is an existing JSON column — no schema migration required.
+ */
+
+const LAUNCH_CONTEXT_MAX_LENGTH = 2000;
+const DEFAULT_LAUNCH_SOURCE = 'web';
+
+function normalizeLaunchSource(source) {
+  const value = String(source === undefined || source === null ? '' : source)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, '');
+  return (value || DEFAULT_LAUNCH_SOURCE).slice(0, 40);
+}
+
+function normalizeLaunchContext(context) {
+  if (context === undefined || context === null) return null;
+  try {
+    const text = typeof context === 'string' ? context.trim() : JSON.stringify(context);
+    if (!text || text === 'null' || text === '""' || text === '{}') return null;
+    return text.length > LAUNCH_CONTEXT_MAX_LENGTH ? text.slice(0, LAUNCH_CONTEXT_MAX_LENGTH) : text;
+  } catch {
+    return null;
+  }
+}
+
+function hasLaunchSource(source) {
+  return source !== undefined && source !== null && String(source).trim() !== '';
+}
+
+/**
+ * Build the metadata payload for a test attempt.
+ * Returns null when neither `source` nor a usable `context` was provided, so
+ * existing callers keep byte-identical behaviour.
+ */
+function buildLaunchMetadata({ source, context } = {}) {
+  const normalizedContext = normalizeLaunchContext(context);
+  const provided = hasLaunchSource(source) || normalizedContext !== null;
+  if (!provided) return null;
+
+  return {
+    launch: {
+      source: normalizeLaunchSource(source),
+      context: normalizedContext,
+      at: new Date().toISOString()
+    }
+  };
+}
+
 module.exports = {
   formatResponse,
   paginateResults,
   calculateAverageKPI,
   formatTime,
-  generateRandomPassword
+  generateRandomPassword,
+  normalizeLaunchSource,
+  normalizeLaunchContext,
+  buildLaunchMetadata
 };

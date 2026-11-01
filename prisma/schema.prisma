@@ -32,6 +32,7 @@ model User {
   assignedTests          UserTest[]
 
   aiUsageRecords   AiUsage[]
+  aiConversations  AiConversation[]
   teamProblems     TeamProblem[]
   teamSolutions    TeamSolution[]
   solutionLikes    SolutionLike[]
@@ -52,6 +53,7 @@ model Company {
   organizationSize String?
   country          String?
   isActive         Boolean       @default(true)
+  guestMode        Boolean       @default(false)
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
   deletedAt        DateTime?
@@ -63,6 +65,7 @@ model Company {
   teamProblems     TeamProblem[]
   teamSolutions    TeamSolution[]
   reportEmbeddings   ReportEmbedding[]
+  aiConversations    AiConversation[]
 }
 
 model Test {
@@ -117,6 +120,10 @@ model UserTest {
   startedAt   DateTime?
   completedAt DateTime?
   brief       String?        @db.Text
+  // Who created this assignment: 'manager' (assigned from the manager/admin
+  // dashboard) or 'self' (started by the user from the dashboard). Null = legacy
+  // row created before this field existed (treated as manager-assigned).
+  source      String?
   totalTime   Int?
   report      Report?
   attempts    TestAttempt[]
@@ -221,6 +228,44 @@ model AiUsage {
   @@index([companyId])
   @@index([source])
   @@index([createdAt])
+}
+
+model AiConversation {
+  id            Int                   @id @default(autoincrement())
+  userId        Int?
+  companyId     Int?
+  scope         String                @default("company") // "company" | "admin"
+  title         String                @default("AI Conversation")
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+  deletedAt     DateTime?
+
+  user          User?                 @relation(fields: [userId], references: [id])
+  company       Company?              @relation(fields: [companyId], references: [id])
+  messages      AiConversationMessage[]
+
+  @@index([userId])
+  @@index([companyId])
+  @@index([scope])
+  @@index([companyId, scope, updatedAt])
+}
+
+model AiConversationMessage {
+  id             Int            @id @default(autoincrement())
+  conversationId Int
+  role           String         // "user" | "assistant"
+  content        String         @db.Text
+  source         String?
+  chartSpec      Json?
+  imageUrl       String?
+  imageSize      String?
+  metadata       Json?
+  createdAt      DateTime       @default(now())
+
+  conversation   AiConversation @relation(fields: [conversationId], references: [id])
+
+  @@index([conversationId])
+  @@index([conversationId, createdAt])
 }
 model TeamProblem {
   id            Int           @id @default(autoincrement())

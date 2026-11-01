@@ -59,6 +59,18 @@ async function assignTestToCompany(req, res, next) {
   }
 }
 
+async function unassignTestFromCompany(req, res, next) {
+  try {
+    const result = await testService.unassignTestFromCompany({
+      testId: parseInt(req.params.testId),
+      companyId: parseInt(req.params.companyId)
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function bulkAssignTests(req, res, next) {
   try {
     const result = await testService.bulkAssignTests({
@@ -115,6 +127,7 @@ module.exports = {
   updateTest,
   deleteTest,
   assignTestToCompany,
+  unassignTestFromCompany,
   bulkAssignTests,
   getCustomTest,
   createCustomTest,

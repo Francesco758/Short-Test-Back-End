@@ -698,6 +698,77 @@ Rules:
 }
 
 /**
+ * Rerank a list of retrieval candidates using an LLM cross-encoder-style pass.
+ * Returns a re-ordered subset (topK) or `null` if the model is unavailable, so callers
+ * can fall back to their deterministic ordering. The LLM is instructed to rank purely
+ * by relevance to the user question and to never fabricate.
+ *
+ * `candidates`: array of { summary, topic, type, ... }
+ * Returns a NEW array (never mutates input) limited to `topK`, ordered best-first.
+ */
+async function rerankCandidates({ question, candidates, topK = 5, context }) {
+  try {
+    await loadConfigIfStale();
+    if (!_cfg.apiKey) return null;
+    if (!Array.isArray(candidates) || candidates.length <= 1) return candidates;
+
+    const window = candidates.slice(0, 20);
+    const numbered = window
+      .map((c, i) => `${i + 1}. [${c.type || 'entry'}] "${c.summary}"${c.topic ? ` (topic: ${c.topic})` : ''}`)
+      .join('\n');
+
+    const system = `You are a retrieval re-ranking model. Given a user question and a numbered list of candidate entries, return a JSON array of the indices of the ${topK} most relevant entries, ordered from most to least relevant.\nONLY consider relevance to the question. Do not add any text outside the JSON array. If fewer than ${topK} are relevant, return only the relevant ones.`;
+
+    const body = {
+      model: _cfg.model || 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: `Question: ${question}\n\nCandidates:\n${numbered}` }
+      ],
+      temperature: 0,
+      max_tokens: 128,
+      response_format: { type: 'json_object' }
+    };
+
+    const res = await fetchWithRetries(OPENAI_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${_cfg.apiKey}` },
+      body: JSON.stringify(body)
+    }, { retries: 1, timeoutMs: 15000 });
+
+    if (!res.ok) {
+      console.warn('[Reranker] LLM rerank failed:', res.status);
+      return null;
+    }
+
+    const payload = await res.json();
+    if (payload.usage && context) {
+      recordUsage({ ...context, model: _cfg.model, promptTokens: payload.usage.prompt_tokens || 0, completionTokens: payload.usage.completion_tokens || 0, totalTokens: payload.usage.total_tokens || 0, endpoint: 'rerankCandidates' });
+    }
+
+    const raw = payload.choices?.[0]?.message?.content || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const indices = Array.isArray(parsed) ? parsed : (parsed.indices || parsed.ranked_indices || parsed.ids || []);
+    if (!Array.isArray(indices) || !indices.length) return null;
+
+    const out = [];
+    for (const idx of indices) {
+      const num = Number(idx);
+      const candidate = window[num - 1];
+      if (candidate && !out.includes(candidate)) out.push(candidate);
+      if (out.length >= topK) break;
+    }
+    return out.length ? out : null;
+  } catch (err) {
+    console.warn('[Reranker] Failed, falling back to deterministic order:', err.message);
+    return null;
+  }
+}
+
+/**
  * Normalize chart spec for client rendering.
  */
 function normalizeChartSpec(args) {
@@ -716,5 +787,6 @@ module.exports = {
   streamChatCompletion,
   evaluateAnswer,
   runChatWithTools,
+  rerankCandidates,
   defaultTools
 };

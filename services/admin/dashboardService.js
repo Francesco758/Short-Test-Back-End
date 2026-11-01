@@ -443,7 +443,11 @@ module.exports = { getDashboardStats, getRecentActivity, getCompanyPerformance, 
 
 const { streamChatCompletion, runChatWithTools } = require('../gptService');
 
-async function querySystemData(question, user, history = []) {
+async function querySystemData(question, user, history = [], onChunk = null) {
+  // Guardrails: sanitize input up front (strip injection, cap length).
+  const { sanitizeUserInput } = require('../guardrailService');
+  question = sanitizeUserInput(question) || question;
+
   const companies = await prisma.company.findMany({
     where: { deletedAt: null },
     select: { id: true, name: true, description: true, isActive: true, createdAt: true }
@@ -477,8 +481,9 @@ async function querySystemData(question, user, history = []) {
   // Fire vector search in parallel with problem overview (hides ~1s embedding API latency)
   let vectorSearchPromise = Promise.resolve([]);
   try {
-    const { searchSimilarReports } = require('../embeddingService');
-    vectorSearchPromise = searchSimilarReports(null, question, { limit: 10 }).catch(() => []);
+    const { searchSimilarReports, buildRetrievalQuery } = require('../embeddingService');
+    const retrievalQuery = buildRetrievalQuery(question, history);
+    vectorSearchPromise = searchSimilarReports(null, retrievalQuery, { limit: 10, rerank: true }).catch(() => []);
   } catch { /* embedding service unavailable */ }
 
   const psOverview = await getProblemSolutionOverview({ companyId: null, limit: 20 });
@@ -490,10 +495,10 @@ async function querySystemData(question, user, history = []) {
     const matches = await vectorSearchPromise;
 
     if (matches.length) {
-      const typeLabel = (m) => m.type === 'problem' ? 'Problem' : 'Solution';
+      const typeLabel = (m) => ({ problem: 'Problem', solution: 'Solution', ckpi: 'CKPI Evaluation', conversation: 'Conversation' }[m.type] || 'Report');
       const lines = ['\n\n--- Semantically Related Report Summaries ---'];
-      lines.push('The following individual report entries are most relevant to this question (via vector similarity):');
-      matches.forEach(m => lines.push(`  - [${typeLabel(m)}] "${m.summary}" — ${m.topic} (relevance: ${(m.similarity * 100).toFixed(0)}%)`));
+      lines.push('The following individual report entries are most relevant to this question (hybrid relevance >40%):');
+      matches.forEach(m => lines.push(`  - [${typeLabel(m)}] "${m.summary}" — ${m.topic} (relevance: ${(m.score * 100).toFixed(0)}%)`));
       vectorHint = lines.join('\n');
     }
   } catch (vecErr) {
@@ -503,6 +508,9 @@ async function querySystemData(question, user, history = []) {
   // Deterministic answers for common queries (no AI cost)
   const deterministic = tryDeterministicAdminAnswer(question, summary);
   if (deterministic) {
+    if (typeof onChunk === 'function') {
+      onChunk(deterministic.answer);
+    }
     return {
       answer: deterministic.answer,
       source: 'deterministic',
@@ -518,6 +526,9 @@ async function querySystemData(question, user, history = []) {
     const { semanticAnswer } = require('../semanticQueryService');
     const semantic = await semanticAnswer(question, summary, true);
     if (semantic) {
+      if (typeof onChunk === 'function' && typeof semantic.answer === 'string') {
+        onChunk(semantic.answer);
+      }
       return semantic;
     }
   } catch (semErr) {
@@ -536,8 +547,38 @@ You can generate charts or images when they would help visualize the global tren
   const content = `Dataset:\n\n${dataBlock}${vectorHint}`;
 
   try {
-    // Use enhanced GPT service with tools for chart/image generation
     const adminContext = { userId: user?.id, source: 'admin_query' };
+
+    // Streaming mode: forward GPT tokens as they arrive.
+    if (typeof onChunk === 'function') {
+      return await new Promise((resolve, reject) => {
+        let answer = '';
+        streamChatCompletion({
+          model: process.env.OPENAI_STREAM_MODEL || 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: system },
+            ...history,
+            { role: 'user', content: `${content}\n\nQuestion: ${question}` }
+          ],
+          temperature: 0.2,
+          context: adminContext,
+          onChunk: (chunk) => {
+            answer += chunk;
+            onChunk(chunk);
+          },
+          onDone: () => resolve({
+            answer,
+            chartSpec: null,
+            imageUrl: null,
+            imageSize: null,
+            metadata: { vectorEnriched: !!vectorHint, intent: 'open_query', filtersApplied: ['global scope'] }
+          }),
+          onError: (err) => reject(err)
+        });
+      });
+    }
+
+    // Use enhanced GPT service with tools for chart/image generation
     const { content: answer, toolOutputs } = await runChatWithTools({
       model: process.env.OPENAI_STREAM_MODEL || 'gpt-4o-mini',
       messages: [

@@ -13,5 +13,9 @@ router.get('/problem-solution-overview', authRequired, companyAdminOnly, control
 router.get('/deadlines', authRequired, companyAdminOnly, controller.getUpcomingDeadlines);
 router.get('/ckpi-metrics', authRequired, companyAdminOnly, controller.getCompanyCKPIMetrics);
 router.post('/query', authRequired, companyAdminOnly, companyQueryLimiter, controller.queryCompanyData);
+router.post('/query/stream', authRequired, companyAdminOnly, companyQueryLimiter, controller.queryCompanyDataStream);
+router.get('/conversations', authRequired, companyAdminOnly, controller.getAiConversations);
+router.get('/conversations/:id', authRequired, companyAdminOnly, controller.getAiConversation);
+router.delete('/conversations/:id', authRequired, companyAdminOnly, controller.deleteAiConversation);
 
 module.exports = router;

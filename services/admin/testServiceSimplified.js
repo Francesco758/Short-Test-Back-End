@@ -1,4 +1,5 @@
 const { prisma } = require('../../utils/prismaClient');
+const { ValidationError, NotFoundError } = require('../../utils/errors');
 
 /**
  * Simplified Test Service
@@ -238,7 +239,8 @@ async function assignTestToCompany({ testId, companyId, assignedById }) {
         userId: user.id,
         testId: parseInt(testId),
         companyId: parseInt(companyId),
-        status: 'ASSIGNED'
+        status: 'ASSIGNED',
+        source: 'manager'
       }))
     });
   }
@@ -247,6 +249,58 @@ async function assignTestToCompany({ testId, companyId, assignedById }) {
     assignment,
     usersAssigned: companyUsers.length,
     message: `Test assigned to ${company.name} (${companyUsers.length} users)`
+  };
+}
+
+/**
+ * Remove a test assignment from a company.
+ *
+ * Data-safe by design:
+ * - Deletes the company-level assignment (CompanyTest).
+ * - Deletes only the user assignments that were never started (status 'ASSIGNED'),
+ *   so those cards disappear from employees' dashboards.
+ * - Everything that is IN_PROGRESS or COMPLETED is intentionally kept, together
+ *   with all its attempts, chat messages and reports. Nothing is hard-deleted and
+ *   the Test record itself is untouched.
+ *
+ * Both deletes run in a single transaction so the assignment can never end up
+ * removed without its pending cards.
+ */
+async function unassignTestFromCompany({ testId, companyId }) {
+  const tid = parseInt(testId, 10);
+  const cid = parseInt(companyId, 10);
+
+  if (Number.isNaN(tid) || Number.isNaN(cid)) {
+    throw new ValidationError('testId and companyId must be numbers');
+  }
+
+  const existing = await prisma.companyTest.findUnique({
+    where: {
+      companyId_testId: {
+        companyId: cid,
+        testId: tid
+      }
+    }
+  });
+
+  if (!existing) {
+    throw new NotFoundError('Test is not assigned to this company');
+  }
+
+  const [, removedUserTests] = await prisma.$transaction([
+    prisma.companyTest.delete({ where: { id: existing.id } }),
+    prisma.userTest.deleteMany({
+      where: {
+        companyId: cid,
+        testId: tid,
+        status: 'ASSIGNED'
+      }
+    })
+  ]);
+
+  return {
+    message: 'Test unassigned from company',
+    removedAssignments: removedUserTests.count
   };
 }
 
@@ -367,6 +421,7 @@ module.exports = {
   updateTest,
   deleteTest,
   assignTestToCompany,
+  unassignTestFromCompany,
   bulkAssignTests,
   getCustomTest,
   createCustomTest,

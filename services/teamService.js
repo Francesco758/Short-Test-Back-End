@@ -145,7 +145,8 @@ async function startTeamTest(user, context) {
       companyId: user.companyId,
       status: 'IN_PROGRESS',
       brief,
-      startedAt: new Date()
+      startedAt: new Date(),
+      source: 'self'
     }
   });
 

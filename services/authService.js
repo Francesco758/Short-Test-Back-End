@@ -273,6 +273,25 @@ async function guestLogin(payload) {
   const normalizedGuestName = name.trim().replace(/\s+/g, ' ').toLowerCase();
   const cId = parseInt(companyId);
 
+  // Guest mode is a company-level switch. Reject when it is off so guest
+  // accounts cannot be created (or reused) for companies that never enabled it.
+  const company = await prisma.company.findUnique({
+    where: { id: cId },
+    select: { id: true, name: true, guestMode: true, isActive: true, deletedAt: true }
+  });
+
+  if (!company || company.deletedAt || !company.isActive) {
+    const err = new Error('Company not found');
+    err.status = 404;
+    throw err;
+  }
+
+  if (company.guestMode !== true) {
+    const err = new Error('Guest access is not enabled for this company');
+    err.status = 403;
+    throw err;
+  }
+
   // Check if guest with same name + company already exists (reuse it)
   let guestUser = await prisma.user.findFirst({
     where: { name: normalizedGuestName, companyId: cId, isGuest: true, deletedAt: null },

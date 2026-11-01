@@ -13,6 +13,7 @@ router.post('/', authRequired, superAdminOnly, controller.createTest);
 router.get('/', authRequired, superAdminOnly, controller.getAllTests);
 router.post('/bulk-assign', authRequired, superAdminOnly, controller.bulkAssignTests);
 router.post('/:testId/assign', authRequired, superAdminOnly, controller.assignTestToCompany);
+router.delete('/:testId/assign/:companyId', authRequired, superAdminOnly, controller.unassignTestFromCompany);
 router.get('/:id', authRequired, superAdminOnly, controller.getTestById);
 router.put('/:id', authRequired, superAdminOnly, controller.updateTest);
 router.delete('/:id', authRequired, superAdminOnly, controller.deleteTest);

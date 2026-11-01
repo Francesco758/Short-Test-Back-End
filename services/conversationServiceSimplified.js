@@ -3,6 +3,7 @@ const { streamChatCompletion, evaluateAnswer, runChatWithTools, defaultTools } =
 const teamService = require('./teamService');
 const logger = require('../utils/logger');
 const { ConflictError, ValidationError } = require('../utils/errors');
+const { buildLaunchMetadata } = require('../utils/helpers');
 
 const MAX_MESSAGES_PER_ATTEMPT = 50;
 const MIN_MESSAGE_INTERVAL_MS = 2000;
@@ -19,7 +20,7 @@ const MAX_IMAGE_GENERATIONS_PER_ATTEMPT = 8;
  * Start a new test conversation
  */
 async function startTestConversation({ user, body, requestId }) {
-  const { userTestId } = body;
+  const { userTestId, source, context } = body;
 
   const log = logger.child({ requestId, userTestId, component: 'startTest' });
 
@@ -46,6 +47,19 @@ async function startTestConversation({ user, body, requestId }) {
     throw new Error('Test not found or not assigned to you');
   }
 
+  // Guests may only take tests while their company's guest mode is on.
+  // Deactivation flips Company.guestMode off, which must immediately stop any
+  // still-logged-in guest from starting or resuming.
+  if (user?.isGuest && user?.companyId) {
+    const company = await prisma.company.findUnique({
+      where: { id: user.companyId },
+      select: { guestMode: true }
+    });
+    if (company?.guestMode !== true) {
+      throw new ValidationError('Guest access is no longer enabled for this company');
+    }
+  }
+
   if (userTest.status === 'COMPLETED') {
     throw new Error('Test already completed');
   }
@@ -63,12 +77,19 @@ async function startTestConversation({ user, body, requestId }) {
     testAttempt = userTest.attempts[0];
   } else {
     // Create new attempt
+    // Optional launch attribution (originating system + optional context such as
+    // an email subject or a Teams message) is stored on the existing JSON
+    // metadata column. When no source/context is sent, nothing is written and
+    // behaviour is exactly as before.
+    const launchMetadata = buildLaunchMetadata({ source, context });
+
     testAttempt = await prisma.testAttempt.create({
       data: {
         userTestId: userTest.id,
         testId: userTest.test.id,
         messageCount: 0,
-        isCompleted: false
+        isCompleted: false,
+        ...(launchMetadata ? { metadata: launchMetadata } : {})
       }
     });
 
@@ -810,6 +831,18 @@ IMPORTANT: All scores must be integers between 0 and 100.`;
   if (userTest.companyId && evaluationResult) {
     teamService.extractFromEvaluation(evaluationResult, userTest.companyId, user.id)
       .catch(err => log.warn({ err }, 'Failed to extract team problems'));
+  }
+
+  // Sync report embeddings for RAG (fire-and-forget, additive — never touches source data)
+  if (userTest.companyId) {
+    const { ensureReportEmbeddings } = require('./embeddingService');
+    ensureReportEmbeddings(userTest.companyId)
+      .then((res) => {
+        if (res && (res.created || res.updated)) {
+          log.info({ created: res.created, updated: res.updated }, 'Report embeddings synced');
+        }
+      })
+      .catch(err => log.warn({ err }, 'Failed to sync report embeddings'));
   }
 
   // Update user test status with completion time

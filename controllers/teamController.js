@@ -32,7 +32,7 @@ async function startProblemTest(req, res, next) {
     if (!problem) return res.status(404).json({ error: 'Problem not found' });
 
     const result = await teamService.startTeamTest(req.user, {
-      brief: `Team Problem: ${problem.topic}\n\n${problem.description}`,
+      brief: `Problem: ${problem.topic}\n\n${problem.description}`,
       title: `Challenge: ${problem.topic}`
     });
 
@@ -50,7 +50,7 @@ async function startSolutionTest(req, res, next) {
     if (!solution) return res.status(404).json({ error: 'Solution not found' });
 
     const result = await teamService.startTeamTest(req.user, {
-      brief: `Improve Team Solution: ${solution.topic}\n\n${solution.description}`,
+      brief: `Solution: ${solution.topic}\n\n${solution.description}`,
       title: `Improve: ${solution.topic}`
     });
 

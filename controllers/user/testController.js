@@ -43,10 +43,35 @@ async function getTestStatus(req, res, next) {
   } catch (err) { next(err); }
 }
 
+// NEW: standard shorTests the current user is allowed to start on their own
+async function getAvailableTests(req, res, next) {
+  try {
+    const result = await testService.getAvailableStandardTests(req.user);
+    res.json(result);
+  } catch (err) { next(err); }
+}
+
+// NEW: start a brand new standard shorTest (self-serve, and the API entry point
+// that external systems — Teams, Outlook, extensions, intranets — can call later)
+async function launchTest(req, res, next) {
+  try {
+    const { testId = null, source = null, context = null } = req.body || {};
+    const result = await testService.launchStandardTest({
+      user: req.user,
+      testId,
+      source,
+      context
+    });
+    res.status(201).json(result);
+  } catch (err) { next(err); }
+}
+
 module.exports = { 
   getAssignedTests, 
   startTest, 
   submitAnswer, 
   finishTest, 
-  getTestStatus 
+  getTestStatus,
+  getAvailableTests,
+  launchTest
 };
